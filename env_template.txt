@@ -1,0 +1,21 @@
+# --- Shopify ---
+SHOPIFY_SHOP=your-shop.myshopify.com
+SHOPIFY_ADMIN_TOKEN=shpat_xxx
+
+# --- Dropbox ---
+DROPBOX_TOKEN=sl.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+DROPBOX_ROOT=/Store/orders
+
+# --- Noritsu source (UNC/local path the scanner/server can read) ---
+NORITSU_ROOT=\\SERVER\Noritsu\Scans   # e.g. C:\Noritsu\Scans or \\server\share\Scans
+
+# --- Behavior toggles ---
+AUTO_TAG_S=true                      # add order tag "s" after upload (triggers your Flow)
+CUSTOMER_LINK_FIELD_NS=custom
+CUSTOMER_LINK_FIELD_KEY=dropbox_root_url
+
+# Optional labeling
+LAB_NAME=Noritsu-01
+
+# Seconds with no file writes before a twin_check is considered "ready"
+SETTLE_SECONDS=8

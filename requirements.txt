@@ -1,0 +1,5 @@
+watchdog==5.0.3
+dropbox==11.36.2
+python-dotenv==1.0.1
+tenacity==9.0.0
+requests==2.32.3
