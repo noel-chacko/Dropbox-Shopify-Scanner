@@ -1,0 +1,21 @@
+# --- Shopify ---
+SHOPIFY_SHOP=your-shop.myshopify.com
+SHOPIFY_ADMIN_TOKEN=shpat_xxx
+
+# --- Dropbox ---
+DROPBOX_TOKEN=sl.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+DROPBOX_ROOT=/PhotoLounge Rittenhouse/Orders
+
+# --- Noritsu source (UNC/local path the scanner/server can read) ---
+NORITSU_ROOT=\\mpl-svr-1\Shared\NORITSU
+
+# --- Behavior toggles ---
+AUTO_TAG_S=false
+CUSTOMER_LINK_FIELD_NS=custom
+CUSTOMER_LINK_FIELD_KEY=dropbox_root_url
+
+# Optional labeling
+LAB_NAME=Noritsu-01
+
+# Seconds with no file writes before a twin_check is considered "ready"
+SETTLE_SECONDS=8
