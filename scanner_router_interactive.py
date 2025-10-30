@@ -6,7 +6,6 @@ WORKFLOW:
 1. Enter order number
 2. Each scan confirms: "XXX twin → Order #100"
 3. Switch orders anytime by entering new order number
-4. Perfect for mixed order scenarios
 """
 
 import os
@@ -328,30 +327,76 @@ def process_scan(twin_dir: Path, date_str: str, twin_check: str):
 
 # =================== WATCHER ===================
 class Handler(FileSystemEventHandler):
+    def __init__(self):
+        self.last_scan_time = time.time()
+        self.scan_interval = 1  # Scan every second for network shares
+        
     def _ready(self, twin_dir: Path) -> bool:
-        files = [f for f in twin_dir.glob("**/*") if f.is_file()]
-        if not files:
+        try:
+            files = []
+            # More robust file enumeration for network shares
+            for attempt in range(3):  # Try up to 3 times
+                try:
+                    files = [f for f in twin_dir.glob("**/*") if f.is_file()]
+                    break
+                except (PermissionError, OSError) as e:
+                    print(f"Retry {attempt + 1} reading directory {twin_dir}: {e}")
+                    time.sleep(0.5)
+            
+            if not files:
+                return False
+                
+            # Check file stability
+            newest = max((f.stat().st_mtime for f in files), default=0)
+            return (time.time() - newest) > SETTLE_SECONDS
+        except Exception as e:
+            print(f"Error checking directory {twin_dir}: {e}")
             return False
-        newest = max((f.stat().st_mtime for f in files), default=0)
-        return (time.time() - newest) > SETTLE_SECONDS
 
     def _scan_tree(self):
-        root = Path(NORITSU_ROOT)
-        if not root.exists():
-            return
+        try:
+            # Throttle scanning on network shares
+            current_time = time.time()
+            if current_time - self.last_scan_time < self.scan_interval:
+                return
+            self.last_scan_time = current_time
 
-        for date_dir in sorted([d for d in root.iterdir() if d.is_dir()]):
-            for twin_dir in sorted([d for d in date_dir.iterdir() if d.is_dir()]):
-                key = f"{date_dir.name}/{twin_dir.name}"
-                if STATE.get(key):
+            root = Path(NORITSU_ROOT)
+            if not root.exists():
+                print(f"⚠️ Warning: Cannot access watch directory: {NORITSU_ROOT}")
+                return
+
+            try:
+                date_dirs = [d for d in root.iterdir() if d.is_dir()]
+            except Exception as e:
+                print(f"⚠️ Error accessing root directory: {e}")
+                return
+
+            for date_dir in sorted(date_dirs):
+                try:
+                    twin_dirs = [d for d in date_dir.iterdir() if d.is_dir()]
+                except Exception as e:
+                    print(f"⚠️ Error accessing date directory {date_dir}: {e}")
                     continue
-                if not self._ready(twin_dir):
-                    continue
-                
-                STATE[key] = True
-                save_state(STATE)
-                
-                process_scan(twin_dir, date_dir.name, twin_dir.name)
+
+                for twin_dir in sorted(twin_dirs):
+                    key = f"{date_dir.name}/{twin_dir.name}"
+                    if STATE.get(key):
+                        continue
+
+                    if not self._ready(twin_dir):
+                        continue
+
+                    try:
+                        # Mark as processing immediately to prevent duplicate detection
+                        STATE[key] = True
+                        save_state(STATE)
+                        process_scan(twin_dir, date_dir.name, twin_dir.name)
+                    except Exception as e:
+                        print(f"⚠️ Error processing {key}: {e}")
+
+        except Exception as e:
+            print(f"⚠️ Error during tree scan: {e}")
 
     def on_any_event(self, event):
         self._scan_tree()
@@ -369,12 +414,35 @@ def main():
     print("   3. Switch orders anytime by entering new order number")
     print("   4. Perfect for mixed order scenarios!")
     print("="*60)
+
+    # Test network share access
+    try:
+        root = Path(NORITSU_ROOT)
+        if not root.exists():
+            print(f"\n⚠️ WARNING: Cannot access watch directory: {NORITSU_ROOT}")
+            print("Please check network connection and permissions")
+            input("Press Enter to continue anyway, or Ctrl+C to exit...")
+        else:
+            try:
+                next(root.iterdir())
+                print(f"\n✅ Successfully connected to network share")
+            except Exception as e:
+                print(f"\n⚠️ WARNING: Can access share but cannot list files: {e}")
+                print("Please check permissions and network stability")
+                input("Press Enter to continue anyway, or Ctrl+C to exit...")
+    except Exception as e:
+        print(f"\n⚠️ ERROR accessing network share: {e}")
+        print("Please verify:")
+        print("1. Network connection is stable")
+        print("2. Share path is correct")
+        print("3. You have necessary permissions")
+        input("Press Enter to continue anyway, or Ctrl+C to exit...")
     
     # Set first order
     set_order()
     
     handler = Handler()
-    observer = Observer()
+    observer = Observer(timeout=10)  # Increased timeout for network shares
     observer.schedule(handler, NORITSU_ROOT, recursive=True)
     observer.start()
     
@@ -423,4 +491,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
