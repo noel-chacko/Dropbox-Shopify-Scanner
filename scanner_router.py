@@ -13,6 +13,13 @@ import json
 from pathlib import Path, PurePosixPath
 from datetime import datetime
 from typing import Dict, Any, List, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed, Future
+import threading
+import queue
+
+# Global upload queue for background processing
+upload_queue = queue.Queue()
+upload_executor = None
 
 from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -35,7 +42,7 @@ DROPBOX_TOKEN = os.getenv("DROPBOX_TOKEN")
 DROPBOX_ROOT = os.getenv("DROPBOX_ROOT", "/Store/orders")
 NORITSU_ROOT = os.getenv("NORITSU_ROOT")
 LAB_NAME = os.getenv("LAB_NAME", "Noritsu")
-SETTLE_SECONDS = int(os.getenv("SETTLE_SECONDS", "8"))
+SETTLE_SECONDS = int(os.getenv("SETTLE_SECONDS", "1"))
 
 AUTO_TAG_S = False  # Disabled due to API version compatibility
 CUSTOMER_LINK_FIELD_NS = os.getenv("CUSTOMER_LINK_FIELD_NS", "custom")
@@ -44,7 +51,22 @@ CUSTOMER_LINK_FIELD_KEY = os.getenv("CUSTOMER_LINK_FIELD_KEY", "dropbox_root_url
 assert SHOPIFY_SHOP and SHOPIFY_ADMIN_TOKEN and DROPBOX_TOKEN and NORITSU_ROOT, \
     "Missing required .env entries (SHOPIFY_SHOP, SHOPIFY_ADMIN_TOKEN, DROPBOX_TOKEN, NORITSU_ROOT)."
 
-DBX = dropbox.Dropbox(DROPBOX_TOKEN, timeout=120)
+# Configure Dropbox client for better performance
+# Using thread-local storage for thread-safe access
+_dropbox_storage = threading.local()
+
+def get_dbx():
+    """Get a thread-local Dropbox client."""
+    if not hasattr(_dropbox_storage, 'dbx'):
+        _dropbox_storage.dbx = dropbox.Dropbox(
+            DROPBOX_TOKEN, 
+            timeout=120,
+            max_retries_on_rate_limit=5
+        )
+    return _dropbox_storage.dbx
+
+# Global DBX for backward compatibility
+DBX = get_dbx()
 SHOPIFY_GRAPHQL = f"https://{SHOPIFY_SHOP}/admin/api/2024-10/graphql.json"
 HDR = {"X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN, "Content-Type": "application/json"}
 
@@ -136,10 +158,10 @@ def _is_sane_file(fp: Path) -> bool:
         st = fp.stat()
     except FileNotFoundError:
         return False
-    # skip 0-byte or still-changing files (conservative: 2s settle)
+    # skip 0-byte or still-changing files (reduced from 2s to 0.5s for faster processing)
     if st.st_size == 0:
         return False
-    if (time.time() - st.st_mtime) < 2:
+    if (time.time() - st.st_mtime) < 0.5:
         return False
     return True
 
@@ -153,7 +175,21 @@ def ensure_folder(path: str) -> None:
 
 def ensure_tree(full_path: str) -> None:
     """Create every component of the given POSIX path if missing."""
+    if not full_path or full_path == "/":
+        return
+    
     parts = [p for p in PurePosixPath(full_path).parts if p != "/"]
+    if not parts:
+        return
+    
+    # Optimize: try to create the entire path at once first
+    try:
+        ensure_folder(full_path)
+        return  # Success, we're done
+    except:
+        pass
+    
+    # Fall back to creating each path component
     cur = ""
     for p in parts:
         cur = f"{cur}/{p}"
@@ -162,30 +198,48 @@ def ensure_tree(full_path: str) -> None:
 @retry(wait=wait_exponential(multiplier=1, min=1, max=30), stop=stop_after_attempt(5))
 def upload_file(local_fp: Path, dropbox_dest: str) -> None:
     size = local_fp.stat().st_size
-    CHUNK = 8 * 1024 * 1024
+    # Increased chunk size for faster uploads (32MB for maximum speed)
+    CHUNK = 32 * 1024 * 1024
+    # Get thread-local Dropbox client for better performance
+    dbx = get_dbx()
+    
     with local_fp.open("rb") as f:
+        # For files under 32MB, use simple upload (fastest)
         if size <= CHUNK:
-            DBX.files_upload(f.read(), dropbox_dest, mode=WriteMode("overwrite"))
+            dbx.files_upload(f.read(), dropbox_dest, mode=WriteMode("overwrite"))
         else:
-            session = DBX.files_upload_session_start(f.read(CHUNK))
+            # For larger files, use chunked upload
+            session = dbx.files_upload_session_start(f.read(CHUNK))
             cursor = dropbox.files.UploadSessionCursor(session.session_id, f.tell())
             commit = dropbox.files.CommitInfo(path=dropbox_dest, mode=WriteMode("overwrite"))
             while f.tell() < size:
                 remaining = size - f.tell()
                 if remaining <= CHUNK:
-                    DBX.files_upload_session_finish(f.read(remaining), cursor, commit)
+                    dbx.files_upload_session_finish(f.read(remaining), cursor, commit)
                 else:
-                    DBX.files_upload_session_append_v2(f.read(CHUNK), cursor)
+                    dbx.files_upload_session_append_v2(f.read(CHUNK), cursor)
                     cursor.offset = f.tell()
+
+def upload_file_wrapper(args):
+    """Wrapper for parallel upload with error handling."""
+    fp, dest, rel = args
+    try:
+        upload_file(fp, dest)
+        return True, rel, None
+    except ApiError as e:
+        return False, rel, f"Dropbox upload failed for {rel}: {e}"
+    except Exception as e:
+        return False, rel, f"Upload exception for {rel}: {e}"
 
 def upload_folder(local_dir: Path, dropbox_photos_dir: str) -> int:
     """
     Recursively upload files under local_dir, preserving relative structure
-    inside dropbox_photos_dir.
+    inside dropbox_photos_dir. Uses parallel uploads for speed.
     """
-    count = 0
-    ensure_tree(dropbox_photos_dir)
-
+    # Collect all files to upload
+    files_to_upload = []
+    parents_to_ensure = set()
+    
     for fp in sorted(local_dir.rglob("*")):
         if not fp.is_file():
             continue
@@ -194,22 +248,38 @@ def upload_folder(local_dir: Path, dropbox_photos_dir: str) -> int:
 
         rel = fp.relative_to(local_dir).as_posix()
         dest = f"{dropbox_photos_dir}/{rel}"
-
-        # ensure any subfolders exist in Dropbox
+        
+        # Track parent directories that need to be created
         parent = str(PurePosixPath(dest).parent)
-        ensure_tree(parent)
-
-        try:
-            upload_file(fp, dest)
-            count += 1
-            print(f"  • uploaded {rel}")
-        except ApiError as e:
-            print(f"[ERROR] Dropbox upload failed for {rel}: {e}")
-        except Exception as e:
-            print(f"[ERROR] Upload exception for {rel}: {e}")
-
-    if count == 0:
+        if parent and parent != "/":
+            parents_to_ensure.add(parent)
+        
+        files_to_upload.append((fp, dest, rel))
+    
+    if not files_to_upload:
         print("[WARN] No files matched for upload (check subfolders and temp files).")
+        return 0
+    
+    # Ensure all parent directories exist (batch operation)
+    print(f"Ensuring {len(parents_to_ensure)} directories...")
+    for parent in sorted(parents_to_ensure):
+        ensure_tree(parent)
+    
+    # Upload files in parallel (up to 32 concurrent uploads for maximum speed)
+    total = len(files_to_upload)
+    count = 0
+    with ThreadPoolExecutor(max_workers=32) as executor:
+        # Submit all upload tasks
+        futures = [executor.submit(upload_file_wrapper, args) for args in files_to_upload]
+        
+        # Process completed uploads as they finish
+        for future in as_completed(futures):
+            success, rel, error = future.result()
+            if success:
+                count += 1
+            else:
+                print(f"[ERROR] {error}")
+    
     return count
 
 def make_shared_link(path: str) -> Optional[str]:
