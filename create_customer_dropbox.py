@@ -25,7 +25,7 @@ load_dotenv()
 SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP")
 SHOPIFY_ADMIN_TOKEN = os.getenv("SHOPIFY_ADMIN_TOKEN")
 DROPBOX_TOKEN = os.getenv("DROPBOX_TOKEN")
-DROPBOX_ROOT = os.getenv("DROPBOX_ROOT", "/Store/orders")
+DROPBOX_ROOT = os.getenv("DROPBOX_ROOT", "/Orders")
 # Note: You can override these in .env file, but default is custom_fields.dropbox
 CUSTOMER_LINK_FIELD_NS = os.getenv("CUSTOMER_LINK_FIELD_NS", "custom_fields")
 CUSTOMER_LINK_FIELD_KEY = os.getenv("CUSTOMER_LINK_FIELD_KEY", "dropbox")
