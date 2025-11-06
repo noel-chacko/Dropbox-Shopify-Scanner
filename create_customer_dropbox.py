@@ -562,6 +562,24 @@ def create_customer_dropbox(email_or_order: str) -> None:
     # Create Dropbox folder
     root_path = f"{DROPBOX_ROOT}/{email}"
     print(f"\n📁 Creating Dropbox folder: {root_path}")
+
+    # Check if folder exists and prompt for confirmation
+    try:
+        DBX.files_get_metadata(root_path)
+        print("⚠️  This folder already exists!")
+        confirm1 = input("Do you want to override? (y/n): ").strip().lower()
+        if confirm1 == 'y':
+            print("⚠️  Type 'y' again to confirm override")
+            confirm2 = input("Are you really sure? (y/n): ").strip().lower()
+            if confirm2 != 'y':
+                print("Operation cancelled.")
+                return
+        else:
+            print("Operation cancelled.")
+            return
+    except ApiError:
+        pass  # Folder doesn't exist, proceed as normal
+    
     ensure_tree(root_path)
     
     # Create shared link
