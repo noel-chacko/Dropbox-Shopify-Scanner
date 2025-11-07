@@ -6,7 +6,7 @@ Direct Scanner Router - Uses direct polling instead of watchdog for better netwo
 import os
 import time
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from datetime import datetime
 import threading
 from typing import Dict, Any, List, Tuple, Optional
@@ -26,12 +26,14 @@ DROPBOX_ROOT = os.getenv("DROPBOX_ROOT", "/Store/orders")
 NORITSU_ROOT = os.getenv("NORITSU_ROOT")
 LAB_NAME = os.getenv("LAB_NAME", "Noritsu")
 SETTLE_SECONDS = float(os.getenv("SETTLE_SECONDS", "0.5"))
+CUSTOMER_LINK_FIELD_NS = os.getenv("CUSTOMER_LINK_FIELD_NS", "custom_fields")
+CUSTOMER_LINK_FIELD_KEY = os.getenv("CUSTOMER_LINK_FIELD_KEY", "dropbox")
 
 assert SHOPIFY_SHOP and SHOPIFY_ADMIN_TOKEN and DROPBOX_TOKEN and NORITSU_ROOT, \
     "Missing required .env entries"
 
 # Configure Dropbox client
-DBX = dropbox.Dropbox(DROPBOX_TOKEN, timeout=120)
+DBX = dropbox.Dropbox(DROPBOX_TOKEN, timeout=120, max_retries_on_rate_limit=5)
 SHOPIFY_GRAPHQL = f"https://{SHOPIFY_SHOP}/admin/api/2024-10/graphql.json"
 HDR = {"X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN, "Content-Type": "application/json"}
 
@@ -84,18 +86,105 @@ def shopify_search_orders(q: str) -> List[Dict[str, Any]]:
     data = shopify_gql(query, {"q": q})
     return [e["node"] for e in data["orders"]["edges"]]
 
-def set_customer_dropbox_link(customer_gid: str, url: str) -> None:
+def set_customer_dropbox_link(customer_gid: str, url: str) -> bool:
     mutation = """
     mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
-      metafieldsSet(metafields: $metafields) { userErrors { field message } }
+      metafieldsSet(metafields: $metafields) {
+        metafields { id }
+        userErrors { field message }
+      }
     }"""
-    shopify_gql(mutation, {"metafields": [{
+    result = shopify_gql(mutation, {"metafields": [{
         "ownerId": customer_gid,
-        "namespace": "custom",
-        "key": "dropbox_root_url",
+        "namespace": CUSTOMER_LINK_FIELD_NS,
+        "key": CUSTOMER_LINK_FIELD_KEY,
         "type": "url",
         "value": url
     }]})
+
+    errors = result.get("metafieldsSet", {}).get("userErrors", [])
+    if errors:
+        print("⚠️  Failed to update Shopify metafield:")
+        for err in errors:
+            field = err.get("field", [])
+            if isinstance(field, list):
+                field = ".".join(field)
+            print(f"   Field: {field or 'unknown'} | Message: {err.get('message', 'Unknown error')}")
+        return False
+
+    return True
+
+
+# Dropbox helpers (mirroring create_customer_dropbox)
+def ensure_folder(path: str) -> None:
+    try:
+        DBX.files_create_folder_v2(path, autorename=False)
+    except ApiError:
+        pass
+
+
+def ensure_tree(full_path: str) -> None:
+    if not full_path or full_path == "/":
+        return
+
+    parts = [p for p in PurePosixPath(full_path).parts if p != "/"]
+    if not parts:
+        return
+
+    try:
+        ensure_folder(full_path)
+        return
+    except Exception:
+        pass
+
+    cur = ""
+    for p in parts:
+        cur = f"{cur}/{p}"
+        ensure_folder(cur)
+
+
+def make_shared_link(path: str) -> Optional[str]:
+    try:
+        return DBX.sharing_create_shared_link_with_settings(path).url
+    except ApiError:
+        try:
+            links = DBX.sharing_list_shared_links(path=path).links
+            return links[0].url if links else None
+        except ApiError as e:
+            print(f"⚠️  Could not retrieve shared link for {path}: {e}")
+            return None
+
+
+def ensure_customer_order_folder(order_node: Dict[str, Any]) -> Tuple[str, str]:
+    customer = order_node.get("customer") or {}
+    email = (customer.get("email") or order_node.get("email") or "unknown").strip().lower()
+    customer_gid = customer.get("id")
+
+    root_path = f"{DROPBOX_ROOT}/{email}"
+    ensure_tree(root_path)
+
+    link = make_shared_link(root_path)
+    if link and customer_gid:
+        if set_customer_dropbox_link(customer_gid, link):
+            print(f"💾 Shopify metafield updated for {email}")
+        else:
+            print("⚠️  Metafield update failed; please verify in Shopify.")
+    elif customer_gid and not link:
+        print(f"⚠️  Could not create shared link for {root_path}; Shopify metafield not updated.")
+
+    order_number = (order_node.get("name") or "").replace('#', '').strip()
+    if not order_number:
+        order_number = ''.join(ch for ch in (order_node.get("name") or "") if ch.isdigit()) or "order"
+
+    order_path = f"{root_path}/{order_number}"
+    try:
+        DBX.files_get_metadata(order_path)
+        print(f"⚠️  Order folder already exists: {order_path}")
+    except ApiError:
+        ensure_tree(order_path)
+        print(f"📁 Created order folder: {order_path}")
+
+    return root_path, order_path
 
 # File operations
 def _is_ready(path: Path) -> bool:
@@ -142,19 +231,6 @@ def upload_folder(local_dir: Path, dropbox_path: str) -> int:
     
     return count
 
-def get_or_create_customer_root(order_node: Dict[str, Any]) -> str:
-    """Get or create customer's root Dropbox folder"""
-    customer = order_node.get("customer") or {}
-    email = (customer.get("email") or order_node.get("email") or "unknown").strip()
-    root_path = f"{DROPBOX_ROOT}/{email}"
-    
-    try:
-        DBX.files_create_folder_v2(root_path)
-    except ApiError:
-        pass
-        
-    return root_path
-
 def set_order() -> None:
     """Set the current order interactively"""
     global current_order_data
@@ -190,12 +266,19 @@ def set_order() -> None:
         idx = int(pick) - 1
         if 0 <= idx < len(results):
             order = results[idx]
+            try:
+                root_path, order_path = ensure_customer_order_folder(order)
+            except Exception as exc:
+                print(f"⚠️  Error preparing Dropbox folders: {exc}")
+                root_path, order_path = f"{DROPBOX_ROOT}/pending", f"{DROPBOX_ROOT}/pending"
             with order_lock:
                 current_order_data = {
                     "order_gid": order["id"],
                     "order_no": order["name"],
                     "email": order.get("email", "unknown"),
-                    "order_node": order
+                    "order_node": order,
+                    "dropbox_root_path": root_path,
+                    "dropbox_order_path": order_path
                 }
             print(f"✅ Set to order #{order['name']}")
             return
@@ -230,9 +313,14 @@ def process_scan(scan_dir: Path) -> None:
             dest = f"{DROPBOX_ROOT}/_staging/{scan_name}"
             print(f"\n📤 Uploading {scan_name} to staging...")
         else:
-            customer_root = get_or_create_customer_root(order["order_node"])
-            order_number = order['order_no'].replace('#', '')  # Remove any # characters
-            dest = f"{customer_root}/{order_number}/{scan_name}"
+            order_path = order.get("dropbox_order_path")
+            if not order_path:
+                _, order_path = ensure_customer_order_folder(order["order_node"])
+                with order_lock:
+                    if current_order_data:
+                        current_order_data["dropbox_order_path"] = order_path
+                order["dropbox_order_path"] = order_path
+            dest = f"{order_path}/{scan_name}"
             print(f"\n📤 Uploading {scan_name} to order #{order['order_no']}...")
         
         uploaded = upload_folder(scan_dir, dest)
