@@ -430,7 +430,10 @@ def make_shared_link(path: str) -> Optional[str]:
 
 # =================== MAIN ===================
 def get_email_from_order(order_input: str) -> Optional[tuple]:
-    """Look up email from order number. Returns (email, customer_node) or None."""
+    """Look up email from order number.
+
+    Returns (email, customer_node, order_number_digits) or None.
+    """
     order_input = order_input.strip()
     
     # Build search query
@@ -476,10 +479,13 @@ def get_email_from_order(order_input: str) -> Optional[tuple]:
         return None
     
     order_no = order.get("name", "Unknown")
+    order_digits = ''.join(ch for ch in order_no if ch.isdigit())
+    if not order_digits:
+        order_digits = ''.join(ch for ch in order_input if ch.isdigit())
     print(f"\n✅ Found Order #{order_no}")
     print(f"   Email: {email}")
     
-    return (email, customer)
+    return (email, customer, order_digits)
 
 def create_customer_dropbox(email_or_order: str) -> None:
     """Create Dropbox folder for email and link it to Shopify customer profile.
@@ -489,6 +495,8 @@ def create_customer_dropbox(email_or_order: str) -> None:
     email_or_order = email_or_order.strip()
     
     # Determine if input is email or order number
+    order_folder_number: Optional[str] = None
+
     if '@' in email_or_order:
         # Treat as email
         email = email_or_order.lower()
@@ -498,7 +506,7 @@ def create_customer_dropbox(email_or_order: str) -> None:
         result = get_email_from_order(email_or_order)
         if not result:
             return
-        email, customer_node = result
+        email, customer_node, order_folder_number = result
     
     email = email.strip().lower()
     
@@ -581,6 +589,15 @@ def create_customer_dropbox(email_or_order: str) -> None:
         pass  # Folder doesn't exist, proceed as normal
     
     ensure_tree(root_path)
+
+    if order_folder_number:
+        order_folder_path = f"{root_path}/{order_folder_number}"
+        try:
+            DBX.files_get_metadata(order_folder_path)
+            print(f"⚠️  Order folder already exists: {order_folder_path}")
+        except ApiError:
+            ensure_tree(order_folder_path)
+            print(f"📁 Created order folder: {order_folder_path}")
     
     # Create shared link
     print("🔗 Creating shared link...")
