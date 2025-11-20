@@ -22,16 +22,17 @@ load_dotenv()
 SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP")
 SHOPIFY_ADMIN_TOKEN = os.getenv("SHOPIFY_ADMIN_TOKEN")
 DROPBOX_TOKEN = os.getenv("DROPBOX_TOKEN")
-DROPBOX_ROOT = os.getenv("DROPBOX_ROOT", "/Store/orders")
+DROPBOX_ROOT = os.getenv("DROPBOX_ROOT", "/Orders")
 NORITSU_ROOT = os.getenv("NORITSU_ROOT")
 LAB_NAME = os.getenv("LAB_NAME", "Noritsu")
 SETTLE_SECONDS = float(os.getenv("SETTLE_SECONDS", "0.5"))
+# How often (seconds) to check the watch directory for new folders
+SCAN_INTERVAL = float(os.getenv("SCAN_INTERVAL", "2"))
 CUSTOMER_LINK_FIELD_NS = os.getenv("CUSTOMER_LINK_FIELD_NS", "custom_fields")
 CUSTOMER_LINK_FIELD_KEY = os.getenv("CUSTOMER_LINK_FIELD_KEY", "dropbox")
 
 assert SHOPIFY_SHOP and SHOPIFY_ADMIN_TOKEN and DROPBOX_TOKEN and NORITSU_ROOT, \
     "Missing required .env entries"
-
 # Configure Dropbox client
 DBX = dropbox.Dropbox(DROPBOX_TOKEN, timeout=120, max_retries_on_rate_limit=5)
 SHOPIFY_GRAPHQL = f"https://{SHOPIFY_SHOP}/admin/api/2024-10/graphql.json"
@@ -64,27 +65,27 @@ def shopify_gql(query: str, variables=None) -> Dict[str, Any]:
     return data["data"]
 
 def shopify_search_orders(q: str) -> List[Dict[str, Any]]:
-    query = f"""
-    query($q:String!){{
-      orders(first:10, query:$q, sortKey:CREATED_AT, reverse:true){{
-        edges{{
-          node{{
-            id
-            name
-            email
-            displayFulfillmentStatus
-            customer{{
-              id
-              email
-              displayName
-              metafield(namespace:"custom", key:"dropbox_root_url"){{ value }}
+        query = f"""
+        query($q:String!){{
+            orders(first:10, query:$q, sortKey:CREATED_AT, reverse:true){{
+                edges{{
+                    node{{
+                        id
+                        name
+                        email
+                        displayFulfillmentStatus
+                        customer{{
+                            id
+                            email
+                            displayName
+                            metafield(namespace:\"{CUSTOMER_LINK_FIELD_NS}\", key:\"{CUSTOMER_LINK_FIELD_KEY}\"){{ value }}
+                        }}
+                    }}
+                }}
             }}
-          }}
-        }}
-      }}
-    }}"""
-    data = shopify_gql(query, {"q": q})
-    return [e["node"] for e in data["orders"]["edges"]]
+        }}"""
+        data = shopify_gql(query, {"q": q})
+        return [e["node"] for e in data["orders"]["edges"]]
 
 def set_customer_dropbox_link(customer_gid: str, url: str) -> bool:
     mutation = """
@@ -112,6 +113,40 @@ def set_customer_dropbox_link(customer_gid: str, url: str) -> bool:
             print(f"   Field: {field or 'unknown'} | Message: {err.get('message', 'Unknown error')}")
         return False
 
+    return True
+
+
+def order_add_tags(order_gid: str, tags: List[str]) -> bool:
+    """Add tags to an order using Shopify GraphQL"""
+    if not tags:
+        return True
+    # Use the generic tagsAdd mutation which works for orders and other taggable resources
+    mutation = """
+    mutation tagsAdd($id: ID!, $tags: [String!]!) {
+      tagsAdd(id: $id, tags: $tags) {
+        node { id }
+        userErrors { field message }
+      }
+    }"""
+    try:
+        result = shopify_gql(mutation, {"id": order_gid, "tags": tags})
+    except Exception as e:
+        # shopify_gql raises when top-level 'errors' exist — show details
+        print(f"⚠️  Error adding tags to order (GraphQL error): {e}")
+        return False
+
+    # Inspect userErrors from the tagsAdd response
+    errors = result.get("tagsAdd", {}).get("userErrors", [])
+    if errors:
+        print("⚠️  Failed to add tags to order:")
+        for err in errors:
+            field = err.get("field", [])
+            if isinstance(field, list):
+                field = ".".join(field)
+            print(f"   Field: {field or 'unknown'} | Message: {err.get('message', 'Unknown error')}")
+        return False
+
+    print(f"✅ Tags added: {', '.join(tags)}")
     return True
 
 
@@ -159,18 +194,39 @@ def ensure_customer_order_folder(order_node: Dict[str, Any]) -> Tuple[str, str]:
     customer = order_node.get("customer") or {}
     email = (customer.get("email") or order_node.get("email") or "unknown").strip().lower()
     customer_gid = customer.get("id")
+    # Prefer an existing customer Dropbox root if the customer already has a shared-link saved
+    root_path = None
+    meta = customer.get("metafield")
+    if isinstance(meta, dict):
+        existing_link = meta.get("value")
+    else:
+        existing_link = None
 
-    root_path = f"{DROPBOX_ROOT}/{email}"
-    ensure_tree(root_path)
+    if existing_link:
+        try:
+            md = DBX.sharing_get_shared_link_metadata(existing_link)
+            path = getattr(md, "path_display", None) or getattr(md, "path_lower", None)
+            if path:
+                root_path = path
+                print(f"ℹ️  Using customer's existing Dropbox root: {root_path}")
+            else:
+                print(f"⚠️  Shared link exists but no path was available; falling back to default root for {email}")
+        except Exception as e:
+            print(f"⚠️  Could not resolve customer's shared link metadata: {e}; falling back to default root for {email}")
 
-    link = make_shared_link(root_path)
-    if link and customer_gid:
-        if set_customer_dropbox_link(customer_gid, link):
-            print(f"💾 Shopify metafield updated for {email}")
-        else:
-            print("⚠️  Metafield update failed; please verify in Shopify.")
-    elif customer_gid and not link:
-        print(f"⚠️  Could not create shared link for {root_path}; Shopify metafield not updated.")
+    # Fallback: default to standard DROPBOX_ROOT/email
+    if not root_path:
+        root_path = f"{DROPBOX_ROOT}/{email}"
+        ensure_tree(root_path)
+
+        link = make_shared_link(root_path)
+        if link and customer_gid:
+            if set_customer_dropbox_link(customer_gid, link):
+                print(f"💾 Shopify metafield updated for {email}")
+            else:
+                print("⚠️  Metafield update failed; please verify in Shopify.")
+        elif customer_gid and not link:
+            print(f"⚠️  Could not create shared link for {root_path}; Shopify metafield not updated.")
 
     order_number = (order_node.get("name") or "").replace('#', '').strip()
     if not order_number:
@@ -239,13 +295,39 @@ def set_order() -> None:
         order_num = input("\n🔍 Enter order number (or 'stage'): ").strip()
         if not order_num:
             continue
-            
+
+        # Allow user to quit from this prompt
+        if order_num.lower() == "q":
+            print("Quitting.")
+            os._exit(0)
+
         if order_num.lower() == "stage":
             with order_lock:
                 current_order_data = {"mode": "stage"}
             print("✅ Set to STAGING mode")
             return
-            
+        # Search for order
+        # If there are pending tags on the previously-selected order, apply them now
+        with order_lock:
+            prev = current_order_data
+        if prev and isinstance(prev, dict) and prev.get("pending_tags"):
+            pending = list(prev.get("pending_tags", []))
+            prev_gid = prev.get("order_gid")
+            prev_no = prev.get("order_no")
+            if prev_gid and pending:
+                print(f"\nℹ️ Applying pending tags to previous order {prev_no}: {', '.join(pending)}")
+                try:
+                    order_add_tags(prev_gid, pending)
+                except Exception as e:
+                    print(f"⚠️ Error applying pending tags to {prev_no}: {e}")
+                finally:
+                    with order_lock:
+                        # only clear if current_order_data still refers to the same order
+                        if isinstance(current_order_data, dict) and current_order_data.get("order_gid") == prev_gid:
+                            current_order_data.pop("pending_tags", None)
+            else:
+                print(f"\nℹ️ No order id or no pending tags to apply for previous selection")
+
         # Search for order
         results = shopify_search_orders(f"name:{order_num}")
         if not results:
@@ -259,7 +341,10 @@ def set_order() -> None:
             print(f"{i}) #{r['name']} - {email}")
             
         # Pick order
-        pick = input("\nPick a number: ").strip()
+        pick = input("\nPick a number (or 'q' to quit): ").strip()
+        if pick.lower() == "q":
+            print("Quitting.")
+            os._exit(0)
         if not pick.isdigit():
             continue
             
@@ -271,6 +356,19 @@ def set_order() -> None:
             except Exception as exc:
                 print(f"⚠️  Error preparing Dropbox folders: {exc}")
                 root_path, order_path = f"{DROPBOX_ROOT}/pending", f"{DROPBOX_ROOT}/pending"
+
+            # Prompt for order tag (store as pending; will be applied when next order is entered)
+            tag_input = input("\nWhich tag? (leave blank for none): ").strip()
+            tags = [t.strip() for t in tag_input.split(",") if t.strip()] if tag_input else []
+            tags_confirmed = []
+            if tags:
+                # Single confirmation (one 'y' is enough). Store as pending; do not apply now.
+                confirm = input(f"Type 'y' to confirm tagging order {order['name']} with tags: {', '.join(tags)} (type 'y' to confirm, anything else to cancel): ").strip().lower()
+                if confirm == 'y':
+                    tags_confirmed = tags
+                    print(f"ℹ️ Tags for order {order['name']} are saved and will be applied when you enter the next order number.")
+                else:
+                    print("Tagging aborted.")
             with order_lock:
                 current_order_data = {
                     "order_gid": order["id"],
@@ -280,6 +378,8 @@ def set_order() -> None:
                     "dropbox_root_path": root_path,
                     "dropbox_order_path": order_path
                 }
+                if tags_confirmed:
+                    current_order_data["pending_tags"] = tags_confirmed
             print(f"✅ Set to order #{order['name']}")
             return
 
@@ -370,8 +470,8 @@ def main():
     
     while True:
         try:
-            # Only scan every 2 seconds
-            if time.time() - last_scan < 2:
+            # Only scan based on SCAN_INTERVAL
+            if time.time() - last_scan < SCAN_INTERVAL:
                 time.sleep(0.1)
                 continue
                 
