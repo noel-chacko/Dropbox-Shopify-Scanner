@@ -11,6 +11,7 @@ from datetime import datetime
 import threading
 from typing import Dict, Any, List, Tuple, Optional
 import requests
+import re
 from dotenv import load_dotenv
 import dropbox
 from dropbox.files import WriteMode
@@ -292,20 +293,33 @@ def set_order() -> None:
     global current_order_data
     
     while True:
-        order_num = input("\n🔍 Enter order number (or 'stage'): ").strip()
-        if not order_num:
+        order_num_raw = input("\n🔍 Enter order number (or 'stage'): ").strip()
+        if not order_num_raw:
             continue
 
         # Allow user to quit from this prompt
-        if order_num.lower() == "q":
+        if order_num_raw.lower() == "q":
             print("Quitting.")
             os._exit(0)
 
-        if order_num.lower() == "stage":
+        if order_num_raw.lower() == "stage":
             with order_lock:
                 current_order_data = {"mode": "stage"}
             print("✅ Set to STAGING mode")
             return
+
+        # Parse combined input like '136720s' -> order '136720' and tag 's'
+        order_num = order_num_raw
+        parsed_tags: List[str] = []
+        m = re.match(r"^#?(\d+)(.*)$", order_num_raw)
+        if m:
+            order_num = m.group(1)
+            trailing = (m.group(2) or "").strip()
+            if trailing:
+                # If trailing starts with comma or space, strip separators
+                trailing = trailing.lstrip(' ,')
+                # allow multiple comma-separated tags if provided (e.g. 12345s,urgent)
+                parsed_tags = [t.strip() for t in re.split(r"[,\s]+", trailing) if t.strip()]
         # Search for order
         # If there are pending tags on the previously-selected order, apply them now
         with order_lock:
@@ -334,54 +348,44 @@ def set_order() -> None:
             print("❌ No matches found")
             continue
             
-        # Show matches
-        print("\nMatches found:")
-        for i, r in enumerate(results, 1):
-            email = r.get("email", "unknown")
-            print(f"{i}) #{r['name']} - {email}")
-            
-        # Pick order
-        pick = input("\nPick a number (or 'q' to quit): ").strip()
-        if pick.lower() == "q":
-            print("Quitting.")
-            os._exit(0)
-        if not pick.isdigit():
-            continue
-            
-        idx = int(pick) - 1
-        if 0 <= idx < len(results):
-            order = results[idx]
-            try:
-                root_path, order_path = ensure_customer_order_folder(order)
-            except Exception as exc:
-                print(f"⚠️  Error preparing Dropbox folders: {exc}")
-                root_path, order_path = f"{DROPBOX_ROOT}/pending", f"{DROPBOX_ROOT}/pending"
+        # Auto-select first match and do a single confirmation (no match list)
+        order = results[0]
+        tags_confirmed: List[str] = []
+        try:
+            root_path, order_path = ensure_customer_order_folder(order)
+        except Exception as exc:
+            print(f"⚠️  Error preparing Dropbox folders: {exc}")
+            root_path, order_path = f"{DROPBOX_ROOT}/pending", f"{DROPBOX_ROOT}/pending"
 
-            # Prompt for order tag (store as pending; will be applied when next order is entered)
+        # Determine tags: use parsed tags from initial input if present, otherwise ask
+        tags = parsed_tags
+        if not tags:
             tag_input = input("\nWhich tag? (leave blank for none): ").strip()
             tags = [t.strip() for t in tag_input.split(",") if t.strip()] if tag_input else []
-            tags_confirmed = []
-            if tags:
-                # Single confirmation (one 'y' is enough). Store as pending; do not apply now.
-                confirm = input(f"Type 'y' to confirm tagging order {order['name']} with tags: {', '.join(tags)} (type 'y' to confirm, anything else to cancel): ").strip().lower()
-                if confirm == 'y':
-                    tags_confirmed = tags
-                    print(f"ℹ️ Tags for order {order['name']} are saved and will be applied when you enter the next order number.")
-                else:
-                    print("Tagging aborted.")
-            with order_lock:
-                current_order_data = {
-                    "order_gid": order["id"],
-                    "order_no": order["name"],
-                    "email": order.get("email", "unknown"),
-                    "order_node": order,
-                    "dropbox_root_path": root_path,
-                    "dropbox_order_path": order_path
-                }
-                if tags_confirmed:
-                    current_order_data["pending_tags"] = tags_confirmed
-            print(f"✅ Set to order #{order['name']}")
-            return
+
+        if tags:
+            # Single numeric confirmation: show what will be set and require entering '1' to continue
+            tag_display = ', '.join(tags)
+            confirm = input(f"Order: {order['name']} and Tag: {tag_display}  Enter '1' to continue: ").strip()
+            if confirm == '1':
+                tags_confirmed = tags
+                print(f"ℹ️ Tags for order {order['name']} are saved and will be applied when you enter the next order number.")
+            else:
+                print("Tagging aborted.")
+
+        with order_lock:
+            current_order_data = {
+                "order_gid": order["id"],
+                "order_no": order["name"],
+                "email": order.get("email", "unknown"),
+                "order_node": order,
+                "dropbox_root_path": root_path,
+                "dropbox_order_path": order_path
+            }
+            if tags_confirmed:
+                current_order_data["pending_tags"] = tags_confirmed
+        print(f"✅ Set to order #{order['name']}")
+        return
 
 def process_scan(scan_dir: Path) -> None:
     """Process a single scan directory"""
