@@ -13,9 +13,10 @@ from typing import Dict, Any, List, Tuple, Optional
 import requests
 import re
 from dotenv import load_dotenv
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import dropbox
 from dropbox.files import WriteMode
-from dropbox.exceptions import ApiError
+from dropbox.exceptions import ApiError, RateLimitError
 
 # Load environment variables
 load_dotenv()
@@ -152,10 +153,26 @@ def order_add_tags(order_gid: str, tags: List[str]) -> bool:
 
 
 # Dropbox helpers (mirroring create_customer_dropbox)
+def _extract_rate_limit_error(e: Exception) -> Optional[RateLimitError]:
+    """Extract RateLimitError from ApiError or return None."""
+    if isinstance(e, RateLimitError):
+        return e
+    if isinstance(e, ApiError) and hasattr(e, 'error'):
+        if isinstance(e.error, RateLimitError):
+            return e.error
+    return None
+
+@retry(wait=wait_exponential(multiplier=2, min=2, max=60), stop=stop_after_attempt(5), retry=retry_if_exception_type((RateLimitError, ApiError)))
 def ensure_folder(path: str) -> None:
+    """Create a folder with retry logic for rate limits."""
     try:
         DBX.files_create_folder_v2(path, autorename=False)
-    except ApiError:
+    except (ApiError, RateLimitError) as e:
+        # Extract RateLimitError if nested
+        rate_limit_err = _extract_rate_limit_error(e)
+        if rate_limit_err:
+            raise rate_limit_err
+        # Swallow 'already exists' or race conditions for other errors
         pass
 
 
@@ -258,8 +275,23 @@ def _is_ready(path: Path) -> bool:
         print(f"Error checking {path}: {e}")
         return False
 
+@retry(wait=wait_exponential(multiplier=2, min=2, max=60), stop=stop_after_attempt(5), retry=retry_if_exception_type((RateLimitError, ApiError)))
+def _upload_single_file(file_path: Path, dropbox_file: str) -> bool:
+    """Upload a single file with retry logic for rate limits."""
+    try:
+        with open(file_path, "rb") as f:
+            DBX.files_upload(f.read(), dropbox_file, mode=WriteMode.overwrite)
+        return True
+    except (ApiError, RateLimitError) as e:
+        # Extract RateLimitError if nested
+        rate_limit_err = _extract_rate_limit_error(e)
+        if rate_limit_err:
+            raise rate_limit_err
+        # Re-raise other ApiErrors to trigger retry
+        raise
+
 def upload_folder(local_dir: Path, dropbox_path: str) -> int:
-    """Upload a folder to Dropbox"""
+    """Upload a folder to Dropbox with rate limiting"""
     count = 0
     try:
         # Ensure target directory exists
@@ -268,20 +300,40 @@ def upload_folder(local_dir: Path, dropbox_path: str) -> int:
         except ApiError:
             pass
 
-        # Upload all files
+        # Collect all files to upload
+        files_to_upload = []
         for file_path in local_dir.rglob("*"):
             if not file_path.is_file():
                 continue
-                
             rel_path = file_path.relative_to(local_dir)
             dropbox_file = f"{dropbox_path}/{rel_path}"
-            
+            files_to_upload.append((file_path, dropbox_file))
+        
+        # Upload files sequentially - retry logic handles rate limits automatically
+        for file_path, dropbox_file in files_to_upload:
             try:
-                with open(file_path, "rb") as f:
-                    DBX.files_upload(f.read(), dropbox_file, mode=WriteMode.overwrite)
-                count += 1
+                if _upload_single_file(file_path, dropbox_file):
+                    count += 1
+            except (RateLimitError, ApiError) as e:
+                # If retries are exhausted, log and continue to next file
+                print(f"⚠️  Rate limit error uploading {file_path} after retries: {e}")
             except Exception as e:
                 print(f"Error uploading {file_path}: {e}")
+        
+        # Upload WPPC.jpg as the last file in the folder
+        wppc_path = Path(__file__).parent / "WPPC.jpg"
+        if wppc_path.exists():
+            wppc_dropbox_path = f"{dropbox_path}/WPPC.jpg"
+            try:
+                if _upload_single_file(wppc_path, wppc_dropbox_path):
+                    count += 1
+                    print(f"✅ Added WPPC.jpg to folder")
+            except (RateLimitError, ApiError) as e:
+                print(f"⚠️  Rate limit error uploading WPPC.jpg after retries: {e}")
+            except Exception as e:
+                print(f"⚠️  Error uploading WPPC.jpg: {e}")
+        else:
+            print(f"⚠️  WPPC.jpg not found at {wppc_path}")
                 
     except Exception as e:
         print(f"Error processing folder {local_dir}: {e}")
@@ -434,6 +486,11 @@ def process_scan(scan_dir: Path) -> None:
         STATE[scan_name] = True
         save_state(STATE)
         
+    except RateLimitError as e:
+        print(f"❌ Rate limit error processing {scan_name}: {e}")
+        print("   Waiting 10 seconds before retrying...")
+        time.sleep(10)
+        # Don't mark as processed, so it will be retried
     except Exception as e:
         print(f"❌ Error processing {scan_name}: {e}")
 
