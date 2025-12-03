@@ -701,6 +701,8 @@ class ScannerRouterGUI(QMainWindow):
         
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
+        # Enable HTML formatting for styled messages
+        self.log_text.setAcceptRichText(True)
         # Use system monospace font (cross-platform)
         font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
         font.setPointSize(8)
@@ -835,9 +837,11 @@ class ScannerRouterGUI(QMainWindow):
         self.pending_order_info = order_info
         
         # Show order info in status and log (no popup)
-        self.log_message(f"Found order: #{order_no} ({email}) - Press Enter again to confirm", "SUCCESS")
+        # Format the confirmation message with HTML for bold, underlined, black text
+        confirm_msg = f"Found order: #{order_no} ({email}) - <span style='color: black; font-weight: bold; text-decoration: underline;'>Press Enter again to confirm</span>"
+        self.log_message(confirm_msg, "SUCCESS")
         
-        # Update placeholder to show confirmation needed
+        # Update placeholder to show confirmation needed (plain text for placeholder)
         self.order_input.setPlaceholderText(f"Found: #{order_no} ({email}) - Press Enter to confirm")
         self.order_input.clear()  # Clear the input so they can just press Enter
         self.order_input.setFocus()  # Keep focus so Enter works immediately
