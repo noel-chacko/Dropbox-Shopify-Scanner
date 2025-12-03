@@ -494,6 +494,46 @@ class ScannerRouterGUI(QMainWindow):
         self.order_status_label.setStyleSheet("color: #000000;")
         order_layout.addWidget(self.order_status_label)
         
+        # Pending tags display (bigger and more prominent)
+        self.pending_tags_label = QLabel("")
+        self.pending_tags_label.setFont(QFont("Arial", 14, QFont.Bold))
+        self.pending_tags_label.setStyleSheet("""
+            color: #0066cc;
+            background-color: #e8f4f8;
+            padding: 8px;
+            border: 2px solid #0066cc;
+            border-radius: 3px;
+        """)
+        self.pending_tags_label.setAlignment(Qt.AlignCenter)
+        self.pending_tags_label.setWordWrap(True)
+        order_layout.addWidget(self.pending_tags_label)
+        
+        # Apply tags button
+        self.apply_tags_btn = QPushButton("Apply Pending Tags")
+        self.apply_tags_btn.clicked.connect(self.apply_pending_tags)
+        self.apply_tags_btn.setFont(QFont("Arial", 11, QFont.Bold))
+        self.apply_tags_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #0066cc;
+                color: white;
+                border: 2px solid #0055aa;
+                padding: 8px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #0055aa;
+            }
+            QPushButton:pressed {
+                background-color: #004499;
+            }
+            QPushButton:disabled {
+                background-color: #c0c0c0;
+                color: #808080;
+            }
+        """)
+        self.apply_tags_btn.setEnabled(False)  # Disabled by default
+        order_layout.addWidget(self.apply_tags_btn)
+        
         self.order_dropbox_label = QLabel("")
         self.order_dropbox_label.setWordWrap(True)
         self.order_dropbox_label.setFont(QFont("Arial", 9))
@@ -665,6 +705,9 @@ class ScannerRouterGUI(QMainWindow):
             self.order_email_label.setText("")
             self.order_status_label.setText("")
             self.order_dropbox_label.setText("")
+            self.pending_tags_label.setText("")
+            self.pending_tags_label.setVisible(False)
+            self.apply_tags_btn.setEnabled(False)
             return
         
         if order.get("mode") == "stage":
@@ -672,6 +715,9 @@ class ScannerRouterGUI(QMainWindow):
             self.order_email_label.setText("")
             self.order_status_label.setText("All scans will be uploaded to staging")
             self.order_dropbox_label.setText(f"Dropbox: {router.DROPBOX_ROOT}/_staging/")
+            self.pending_tags_label.setText("")
+            self.pending_tags_label.setVisible(False)
+            self.apply_tags_btn.setEnabled(False)
         else:
             order_no = order.get("order_no", "Unknown")
             # Remove # if it's already in the order number
@@ -683,9 +729,16 @@ class ScannerRouterGUI(QMainWindow):
             
             pending_tags = order.get("pending_tags", [])
             if pending_tags:
-                self.order_status_label.setText(f"Pending tags: {', '.join(pending_tags)}")
+                self.order_status_label.setText("Ready")
+                tags_display = f"Pending Tags: {', '.join(pending_tags)}"
+                self.pending_tags_label.setText(tags_display)
+                self.pending_tags_label.setVisible(True)
+                self.apply_tags_btn.setEnabled(True)
             else:
                 self.order_status_label.setText("Ready")
+                self.pending_tags_label.setText("")
+                self.pending_tags_label.setVisible(False)
+                self.apply_tags_btn.setEnabled(False)
             
             dropbox_path = order.get("dropbox_order_path", "")
             if dropbox_path:
@@ -745,6 +798,48 @@ class ScannerRouterGUI(QMainWindow):
         self.order_input.setPlaceholderText("Enter order number (e.g., 12345 or 12345s)")
         self.log_message(f"❌ No order found for: {order_input}", "ERROR")
         QMessageBox.warning(self, "Order Not Found", f"No order found matching: {order_input}")
+    
+    def apply_pending_tags(self):
+        """Apply pending tags to the current order"""
+        with router.order_lock:
+            order = router.current_order_data
+        
+        if not order or not isinstance(order, dict):
+            QMessageBox.warning(self, "No Order", "No order is currently set.")
+            return
+        
+        pending_tags = order.get("pending_tags", [])
+        order_gid = order.get("order_gid")
+        order_no = order.get("order_no", "Unknown")
+        
+        if not pending_tags:
+            QMessageBox.information(self, "No Pending Tags", "There are no pending tags to apply.")
+            return
+        
+        if not order_gid:
+            QMessageBox.warning(self, "No Order ID", "Cannot apply tags - order ID is missing.")
+            return
+        
+        # Apply tags
+        self.apply_tags_btn.setEnabled(False)
+        self.log_message(f"Applying tags to order #{order_no}: {', '.join(pending_tags)}", "INFO")
+        
+        try:
+            success = router.order_add_tags(order_gid, pending_tags)
+            if success:
+                # Remove pending tags from current order
+                with router.order_lock:
+                    if router.current_order_data and isinstance(router.current_order_data, dict):
+                        router.current_order_data.pop("pending_tags", None)
+                
+                self.log_message(f"✅ Tags applied successfully: {', '.join(pending_tags)}", "SUCCESS")
+                self.refresh_order_info()  # Update display
+            else:
+                self.log_message(f"❌ Failed to apply tags", "ERROR")
+                self.apply_tags_btn.setEnabled(True)
+        except Exception as e:
+            self.log_message(f"❌ Error applying tags: {e}", "ERROR")
+            self.apply_tags_btn.setEnabled(True)
     
     def on_order_set_result(self, success: bool, order_input: str):
         """Handle order set result - show message on main thread"""
