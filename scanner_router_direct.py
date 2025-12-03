@@ -33,7 +33,18 @@ DROPBOX_APP_KEY = os.getenv("DROPBOX_APP_KEY")
 DROPBOX_APP_SECRET = os.getenv("DROPBOX_APP_SECRET")
 DROPBOX_ROOT = os.getenv("DROPBOX_ROOT", "/Orders")
 NORITSU_ROOT_BASE = os.getenv("NORITSU_ROOT", "")
-NORITSU_ROOT = NORITSU_ROOT_BASE  # Can be changed dynamically
+# Auto-set to today's date on startup
+_today_str = datetime.now().strftime("%Y%m%d")
+if NORITSU_ROOT_BASE:
+    # Handle path separators correctly (preserve UNC format for Windows)
+    if NORITSU_ROOT_BASE.startswith("\\\\"):
+        # Preserve UNC path format for Windows (\\server\share)
+        NORITSU_ROOT = f"{NORITSU_ROOT_BASE}\\{_today_str}"
+    else:
+        # Use os.path.join for regular paths
+        NORITSU_ROOT = os.path.join(NORITSU_ROOT_BASE, _today_str)
+else:
+    NORITSU_ROOT = NORITSU_ROOT_BASE  # Fallback if no base path
 LAB_NAME = os.getenv("LAB_NAME", "Noritsu")
 
 # Lock for changing NORITSU_ROOT

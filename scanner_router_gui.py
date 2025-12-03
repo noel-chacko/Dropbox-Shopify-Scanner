@@ -265,8 +265,14 @@ class ScannerRouterGUI(QMainWindow):
         # Initial order info refresh
         self.refresh_order_info()
         
-        # Update scan path display
+        # Update scan path display (will show auto-set date path)
         self.update_scan_path_display()
+        
+        # Log that path was auto-set to today's date
+        current_path = router.get_noritsu_root()
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        if today_str.replace("-", "") in current_path.replace("\\", "/"):
+            self.log_message(f"Scanner path auto-set to today's date: {current_path}", "INFO")
     
     def update_scan_path_display(self):
         """Update the scan path label"""
@@ -855,12 +861,12 @@ class ScannerRouterGUI(QMainWindow):
         dialog.setLayout(layout)
         
         # Instructions
-        info_label = QLabel("Enter tags separated by commas (e.g., urgent, rush, special):")
+        info_label = QLabel("Enter tags separated by commas (e.g., s, bs, sp):")
         layout.addWidget(info_label)
         
         # Tags input
         tags_input = QLineEdit(", ".join(current_tags))
-        tags_input.setPlaceholderText("e.g., urgent, rush, special")
+        tags_input.setPlaceholderText("e.g., s, bs, sp")
         layout.addWidget(tags_input)
         
         # Buttons
