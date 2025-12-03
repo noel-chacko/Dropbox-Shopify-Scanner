@@ -2,8 +2,8 @@
 """
 Direct Scanner Router - Uses direct polling instead of watchdog for better network share handling
 
-VERSION: With Refresh Token Support (Auto-refreshes tokens)
-For simple 4-hour token version, use scanner_router_direct_simple_token.py
+VERSION: Simple Token (4-hour, manual refresh required)
+For auto-refresh token version, use scanner_router_direct.py
 """
 
 import os
@@ -20,7 +20,6 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 import dropbox
 from dropbox.files import WriteMode
 from dropbox.exceptions import ApiError, RateLimitError, AuthError
-from dropbox.common import PathRootError
 
 # Load environment variables
 load_dotenv()
@@ -28,9 +27,6 @@ load_dotenv()
 SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP")
 SHOPIFY_ADMIN_TOKEN = os.getenv("SHOPIFY_ADMIN_TOKEN")
 DROPBOX_TOKEN = os.getenv("DROPBOX_TOKEN")
-DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN")
-DROPBOX_APP_KEY = os.getenv("DROPBOX_APP_KEY")
-DROPBOX_APP_SECRET = os.getenv("DROPBOX_APP_SECRET")
 DROPBOX_ROOT = os.getenv("DROPBOX_ROOT", "/Orders")
 NORITSU_ROOT = os.getenv("NORITSU_ROOT")
 LAB_NAME = os.getenv("LAB_NAME", "Noritsu")
@@ -42,145 +38,12 @@ CUSTOMER_LINK_FIELD_KEY = os.getenv("CUSTOMER_LINK_FIELD_KEY", "dropbox")
 
 assert SHOPIFY_SHOP and SHOPIFY_ADMIN_TOKEN and NORITSU_ROOT, \
     "Missing required .env entries"
+assert DROPBOX_TOKEN, "Missing DROPBOX_TOKEN (required for simple token mode)"
 
-# Refresh token mode: need either token or refresh token setup
-assert DROPBOX_TOKEN or (DROPBOX_REFRESH_TOKEN and DROPBOX_APP_KEY and DROPBOX_APP_SECRET), \
-    "Missing Dropbox credentials (need DROPBOX_TOKEN or DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET)"
-
-# Token storage file
-TOKEN_FILE = Path(".dropbox_tokens.json")
-
-def load_tokens() -> Dict[str, Any]:
-    """Load tokens from file"""
-    if TOKEN_FILE.exists():
-        try:
-            return json.loads(TOKEN_FILE.read_text(encoding="utf-8"))
-        except:
-            return {}
-    return {}
-
-def save_tokens(tokens: Dict[str, Any]) -> None:
-    """Save tokens to file"""
-    TOKEN_FILE.write_text(json.dumps(tokens, indent=2), encoding="utf-8")
-
-def refresh_access_token() -> Optional[str]:
-    """Refresh the Dropbox access token using refresh token"""
-    if not DROPBOX_REFRESH_TOKEN or not DROPBOX_APP_KEY or not DROPBOX_APP_SECRET:
-        return None
-    
-    try:
-        response = requests.post(
-            "https://api.dropbox.com/oauth2/token",
-            data={
-                "grant_type": "refresh_token",
-                "refresh_token": DROPBOX_REFRESH_TOKEN,
-            },
-            auth=(DROPBOX_APP_KEY, DROPBOX_APP_SECRET),
-            timeout=30
-        )
-        response.raise_for_status()
-        data = response.json()
-        
-        new_access_token = data.get("access_token")
-        new_refresh_token = data.get("refresh_token")  # May not always be returned
-        
-        # Save tokens
-        tokens = {
-            "access_token": new_access_token,
-            "refresh_token": new_refresh_token or DROPBOX_REFRESH_TOKEN,  # Keep old if not provided
-            "expires_at": time.time() + data.get("expires_in", 14400)  # Default 4 hours
-        }
-        save_tokens(tokens)
-        
-        return new_access_token
-    except Exception as e:
-        print(f"⚠️  Error refreshing Dropbox token: {e}")
-        return None
-
-def get_dropbox_client():
-    """Get or create Dropbox client with automatic token refresh"""
-    # Try to load from file first (preferred)
-    tokens = load_tokens()
-    access_token = tokens.get("access_token")
-    expires_at = tokens.get("expires_at", 0)
-    
-    # Check if saved token is still valid (refresh 1 hour before expiry)
-    if access_token and time.time() < (expires_at - 3600):
-        try:
-            test_client = dropbox.Dropbox(access_token, timeout=10)
-            test_client.users_get_current_account()
-            return dropbox.Dropbox(access_token, timeout=120, max_retries_on_rate_limit=5)
-        except (ApiError, AuthError, Exception):
-            # Token expired or invalid, try to refresh
-            pass
-    
-    # Try to refresh token if we have refresh token
-    if DROPBOX_REFRESH_TOKEN:
-        new_token = refresh_access_token()
-        if new_token:
-            return dropbox.Dropbox(new_token, timeout=120, max_retries_on_rate_limit=5)
-    
-    # Fallback to environment token (may be expired, but will be refreshed on first use)
-    if DROPBOX_TOKEN:
-        try:
-            test_client = dropbox.Dropbox(DROPBOX_TOKEN, timeout=10)
-            test_client.users_get_current_account()
-            return dropbox.Dropbox(DROPBOX_TOKEN, timeout=120, max_retries_on_rate_limit=5)
-        except (ApiError, AuthError, Exception):
-            # Token expired, but we'll try to refresh on first API call
-            return dropbox.Dropbox(DROPBOX_TOKEN, timeout=120, max_retries_on_rate_limit=5)
-    
-    raise RuntimeError("Unable to get valid Dropbox access token. Need DROPBOX_TOKEN or DROPBOX_REFRESH_TOKEN")
-
-# Configure Dropbox client with automatic refresh
-DBX = get_dropbox_client()
+# Configure Dropbox client (simple token - no auto-refresh)
+DBX = dropbox.Dropbox(DROPBOX_TOKEN, timeout=120, max_retries_on_rate_limit=5)
 SHOPIFY_GRAPHQL = f"https://{SHOPIFY_SHOP}/admin/api/2024-10/graphql.json"
 HDR = {"X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN, "Content-Type": "application/json"}
-
-# Global lock for token refresh
-_token_refresh_lock = threading.Lock()
-
-def refresh_dbx_if_needed():
-    """Refresh Dropbox client if token is expired"""
-    global DBX
-    with _token_refresh_lock:
-        try:
-            # Quick test to see if token works
-            DBX.users_get_current_account()
-        except AuthError as e:
-            # Check if it's an expired token error
-            error_str = str(e).lower()
-            error_reason = None
-            if hasattr(e, 'error'):
-                if hasattr(e.error, 'error'):
-                    error_reason = str(e.error.error).lower()
-                elif hasattr(e.error, 'reason'):
-                    error_reason = str(e.error.reason).lower()
-            
-            if 'expired' in error_str or 'expired_access_token' in error_str or (error_reason and 'expired' in error_reason):
-                print("🔄 Dropbox token expired, refreshing...")
-                new_client = get_dropbox_client()
-                if new_client:
-                    DBX = new_client
-                    print("✅ Dropbox token refreshed successfully")
-                else:
-                    print("⚠️  Failed to refresh Dropbox token")
-        except Exception:
-            pass  # Other errors, don't refresh
-
-def handle_dropbox_auth_error(func):
-    """Decorator to automatically refresh token on auth errors"""
-    def wrapper(*args, **kwargs):
-        try:
-            return func(*args, **kwargs)
-        except AuthError as e:
-            error_str = str(e).lower()
-            if 'expired' in error_str or 'expired_access_token' in error_str:
-                refresh_dbx_if_needed()
-                # Retry once after refresh
-                return func(*args, **kwargs)
-            raise
-    return wrapper
 
 # State management
 STATE_FILE = Path(".processed_jobs.json")
@@ -211,11 +74,6 @@ gui_callbacks = {
 }
 
 # Shopify functions
-@retry(
-    wait=wait_exponential(multiplier=2, min=2, max=30),
-    stop=stop_after_attempt(3),
-    retry=retry_if_exception_type((requests.exceptions.HTTPError, requests.exceptions.ConnectionError))
-)
 def shopify_gql(query: str, variables=None) -> Dict[str, Any]:
     r = requests.post(SHOPIFY_GRAPHQL, headers=HDR, json={"query": query, "variables": variables or {}}, timeout=60)
     r.raise_for_status()
@@ -324,7 +182,6 @@ def _extract_rate_limit_error(e: Exception) -> Optional[RateLimitError]:
 def ensure_folder(path: str) -> None:
     """Create a folder with retry logic for rate limits."""
     try:
-        refresh_dbx_if_needed()
         DBX.files_create_folder_v2(path, autorename=False)
     except (ApiError, RateLimitError) as e:
         # Extract RateLimitError if nested
@@ -357,11 +214,9 @@ def ensure_tree(full_path: str) -> None:
 
 def make_shared_link(path: str) -> Optional[str]:
     try:
-        refresh_dbx_if_needed()
         return DBX.sharing_create_shared_link_with_settings(path).url
     except ApiError:
         try:
-            refresh_dbx_if_needed()
             links = DBX.sharing_list_shared_links(path=path).links
             return links[0].url if links else None
         except ApiError as e:
@@ -383,7 +238,6 @@ def ensure_customer_order_folder(order_node: Dict[str, Any]) -> Tuple[str, str]:
 
     if existing_link:
         try:
-            refresh_dbx_if_needed()
             md = DBX.sharing_get_shared_link_metadata(existing_link)
             path = getattr(md, "path_display", None) or getattr(md, "path_lower", None)
             if path:
@@ -415,32 +269,14 @@ def ensure_customer_order_folder(order_node: Dict[str, Any]) -> Tuple[str, str]:
     order_path = f"{root_path}/{order_number}"
     folder_exists = False
     try:
-        refresh_dbx_if_needed()
-        metadata = DBX.files_get_metadata(order_path)
-        # Check if it's actually a folder
-        if hasattr(metadata, 'is_folder') and metadata.is_folder:
-            folder_exists = True
-            print(f"ℹ️  Order folder already exists: {order_path}")
-            if gui_callbacks['status']:
-                gui_callbacks['status'](f"Order folder already exists: {order_path}")
-        else:
-            # It exists but it's not a folder - this shouldn't happen, but don't overwrite
-            print(f"⚠️  Path exists but is not a folder: {order_path}")
-            folder_exists = True  # Treat as exists to avoid overwriting
-    except ApiError as e:
-        # Check if it's specifically a "not found" error
-        error_str = str(e).lower()
-        error_reason = getattr(e.error, 'get_path', lambda: None)() if hasattr(e, 'error') else None
-        
-        # Only create if we're certain it's a "not found" error
-        if 'not_found' in error_str or 'path_not_found' in error_str or (hasattr(e.error, 'is_path_not_found') and e.error.is_path_not_found()):
-            # Folder doesn't exist - safe to create
-            ensure_tree(order_path)
-            print(f"📁 Created order folder: {order_path}")
-        else:
-            # Other API errors (network, rate limit, etc.) - assume folder exists to be safe
-            print(f"⚠️  Error checking order folder (assuming it exists): {e}")
-            folder_exists = True  # Assume exists to avoid overwriting
+        DBX.files_get_metadata(order_path)
+        folder_exists = True
+        print(f"⚠️  Order folder already exists: {order_path}")
+        if gui_callbacks['status']:
+            gui_callbacks['status'](f"Order folder already exists: {order_path}")
+    except ApiError:
+        ensure_tree(order_path)
+        print(f"📁 Created order folder: {order_path}")
 
     return root_path, order_path
 
@@ -463,7 +299,6 @@ def _is_ready(path: Path) -> bool:
 def _upload_single_file(file_path: Path, dropbox_file: str) -> bool:
     """Upload a single file with retry logic for rate limits."""
     try:
-        refresh_dbx_if_needed()
         with open(file_path, "rb") as f:
             DBX.files_upload(f.read(), dropbox_file, mode=WriteMode.overwrite)
         return True
@@ -482,7 +317,6 @@ def upload_folder(local_dir: Path, dropbox_path: str, progress_callback=None) ->
     try:
         # Ensure target directory exists
         try:
-            refresh_dbx_if_needed()
             DBX.files_create_folder_v2(dropbox_path)
         except ApiError:
             pass
