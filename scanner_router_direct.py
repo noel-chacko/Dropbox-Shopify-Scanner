@@ -428,6 +428,18 @@ def ensure_customer_order_folder(order_node: Dict[str, Any]) -> Tuple[str, str]:
                 # path_display gives us the correct case and full path including team folders
                 root_path = path
                 print(f"ℹ️  Using customer's existing Dropbox root: {root_path}")
+                
+                # Cache the base path for future use (extract everything before the email)
+                global _detected_team_base
+                if not _detected_team_base:
+                    import re
+                    email_pattern = r'/[^/]+@[^/]+/?$'
+                    match = re.search(email_pattern, path)
+                    if match:
+                        base = path[:match.start()]
+                        if base and base != "/Orders":
+                            _detected_team_base = base
+                            print(f"ℹ️  Cached base path from existing customer: {base}")
             else:
                 print(f"⚠️  Shared link exists but no path was available; falling back to default root for {email}")
         except Exception as e:
@@ -437,39 +449,69 @@ def ensure_customer_order_folder(order_node: Dict[str, Any]) -> Tuple[str, str]:
     if not root_path:
         global _detected_team_base
         
-        # Use DROPBOX_ROOT from env, but if it's just "/Orders", try to detect team folder base
+        # Use DROPBOX_ROOT from env, but if it's just "/Orders", try to detect the actual base path
+        # by looking at existing customer folders in Shopify
         dropbox_base = DROPBOX_ROOT
         
         # If we have a cached detected team base, use it
         if _detected_team_base:
             dropbox_base = _detected_team_base
         elif dropbox_base == "/Orders":
-            # Try to detect team folder base by extracting it from existing customer paths
-            # Look for any existing customer folder in the team structure
+            # Try to detect the actual base path by querying Shopify for any customer with a Dropbox link
+            # and extracting the base path from their existing link
             try:
-                refresh_dbx_if_needed()
-                # Common team folder patterns
-                team_base_candidates = [
-                    "/work/PhotoLounge Rittenhouse/Orders",
-                    "/work/PhotoLounge%20Rittenhouse/Orders",
-                ]
+                # Search for any customer with a dropbox metafield to get the base path
+                # Use the configured metafield namespace and key
+                query = f"""
+                {{
+                    customers(first: 10, query: "metafield:{CUSTOMER_LINK_FIELD_NS}.{CUSTOMER_LINK_FIELD_KEY}:*") {{
+                        edges {{
+                            node {{
+                                id
+                                email
+                                metafield(namespace: "{CUSTOMER_LINK_FIELD_NS}", key: "{CUSTOMER_LINK_FIELD_KEY}") {{
+                                    value
+                                }}
+                            }}
+                        }}
+                    }}
+                }}
+                """
+                result = shopify_gql(query)
+                customers = result.get("customers", {}).get("edges", [])
                 
-                for candidate in team_base_candidates:
-                    try:
-                        # Check if this path exists
-                        DBX.files_get_metadata(candidate)
-                        _detected_team_base = candidate
-                        dropbox_base = candidate
-                        print(f"ℹ️  Detected team folder base: {dropbox_base}")
-                        break
-                    except ApiError:
-                        continue
+                for edge in customers:
+                    customer = edge.get("node", {})
+                    meta = customer.get("metafield")
+                    if meta and meta.get("value"):
+                        existing_link = meta.get("value")
+                        try:
+                            refresh_dbx_if_needed()
+                            md = DBX.sharing_get_shared_link_metadata(existing_link)
+                            path = getattr(md, "path_display", None) or getattr(md, "path_lower", None)
+                            if path:
+                                # Extract the base path (everything before the email)
+                                # e.g., "/work/PhotoLounge Rittenhouse/Orders/email@example.com" -> "/work/PhotoLounge Rittenhouse/Orders"
+                                # Find the last "/" before what looks like an email
+                                import re
+                                email_pattern = r'/[^/]+@[^/]+/?$'
+                                match = re.search(email_pattern, path)
+                                if match:
+                                    base = path[:match.start()]
+                                    if base and base != "/Orders":
+                                        _detected_team_base = base
+                                        dropbox_base = base
+                                        print(f"ℹ️  Detected Dropbox base path from existing customer: {dropbox_base}")
+                                        break
+                        except Exception:
+                            continue
                 
-                # If detection failed, cache None to avoid repeated attempts
+                # If detection failed, cache the default to avoid repeated attempts
                 if not _detected_team_base:
-                    _detected_team_base = DROPBOX_ROOT  # Cache the default to avoid retrying
+                    _detected_team_base = DROPBOX_ROOT
+                    print(f"⚠️  Could not detect base path, using default: {DROPBOX_ROOT}")
             except Exception as e:
-                print(f"⚠️  Could not detect team folder base: {e}, using default {DROPBOX_ROOT}")
+                print(f"⚠️  Could not detect base path: {e}, using default {DROPBOX_ROOT}")
         
         root_path = f"{dropbox_base}/{email}"
         ensure_tree(root_path)
