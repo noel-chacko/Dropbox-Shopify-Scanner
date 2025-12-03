@@ -14,10 +14,11 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QTextEdit, QProgressBar,
     QTableWidget, QTableWidgetItem, QGroupBox, QMessageBox,
-    QSplitter, QFrame, QMenuBar, QToolBar, QMenu
+    QSplitter, QFrame, QMenuBar, QToolBar, QMenu, QDateEdit, QDialog,
+    QDialogButtonBox
 )
 import re
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QObject
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QObject, QDate
 from PySide6.QtGui import QFont, QColor, QFontDatabase, QIcon, QAction
 
 # Import the scanner router module
@@ -27,38 +28,55 @@ class ScannerWorker(QThread):
     """Worker thread that runs the scanner loop"""
     status_update = Signal(str)
     error_occurred = Signal(str, str)
+    path_changed = Signal(str)  # Emit when path changes
     
     def __init__(self):
         super().__init__()
         self.running = True
+        self.current_root = None
+        self.existing_folders = set()
+        
+    def update_path(self, new_path: str):
+        """Update the scan path and reset existing folders"""
+        self.current_root = Path(new_path)
+        self.existing_folders = set()
+        if self.current_root.exists():
+            self.existing_folders = {d.name for d in self.current_root.iterdir() if d.is_dir()}
+        self.path_changed.emit(new_path)
         
     def run(self):
         """Run the scanner loop"""
-        root = Path(router.NORITSU_ROOT)
+        # Initialize with current path
+        current_path = router.get_noritsu_root()
+        self.current_root = Path(current_path)
         last_scan = time.time()
-        existing_folders = set()
         
-        if root.exists():
-            existing_folders = {d.name for d in root.iterdir() if d.is_dir()}
+        if self.current_root.exists():
+            self.existing_folders = {d.name for d in self.current_root.iterdir() if d.is_dir()}
         
         while self.running:
             try:
+                # Check if path has changed
+                new_path = router.get_noritsu_root()
+                if str(self.current_root) != new_path:
+                    self.update_path(new_path)
+                
                 if time.time() - last_scan < router.SCAN_INTERVAL:
                     time.sleep(0.1)
                     continue
                 
                 last_scan = time.time()
                 
-                if not root.exists():
-                    self.status_update.emit("⚠️ Cannot access watch directory")
+                if not self.current_root.exists():
+                    self.status_update.emit(f"⚠️ Cannot access: {self.current_root}")
                     time.sleep(5)
                     continue
                 
                 # Scan for new directories
-                for scan_dir in root.iterdir():
+                for scan_dir in self.current_root.iterdir():
                     if not scan_dir.is_dir():
                         continue
-                    if scan_dir.name in existing_folders:
+                    if scan_dir.name in self.existing_folders:
                         continue
                     
                     # Process scan (this will trigger callbacks)
@@ -236,6 +254,7 @@ class ScannerRouterGUI(QMainWindow):
         self.worker = ScannerWorker()
         self.worker.status_update.connect(self.update_status)
         self.worker.error_occurred.connect(self.show_error)
+        self.worker.path_changed.connect(self.on_scan_path_changed)
         self.worker.start()
         
         # Update timer for refreshing order info
@@ -245,6 +264,102 @@ class ScannerRouterGUI(QMainWindow):
         
         # Initial order info refresh
         self.refresh_order_info()
+        
+        # Update scan path display
+        self.update_scan_path_display()
+    
+    def update_scan_path_display(self):
+        """Update the scan path label"""
+        current_path = router.get_noritsu_root()
+        self.scan_path_label.setText(f"Watching: {current_path}")
+    
+    def on_scan_path_changed(self, new_path: str):
+        """Handle scan path change"""
+        self.scan_path_label.setText(f"Watching: {new_path}")
+        self.log_message(f"Scanner path changed to: {new_path}", "INFO")
+    
+    def change_scan_date(self):
+        """Open dialog to change scan date"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Change Scanner Date")
+        dialog.setMinimumWidth(400)
+        
+        layout = QVBoxLayout()
+        dialog.setLayout(layout)
+        
+        # Instructions
+        info_label = QLabel("Select a date to scan. The path will be:\nBASE_PATH\\YYYYMMDD")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+        
+        # Date picker
+        date_label = QLabel("Date:")
+        layout.addWidget(date_label)
+        
+        date_edit = QDateEdit()
+        date_edit.setDate(QDate.currentDate())
+        date_edit.setCalendarPopup(True)
+        date_edit.setDisplayFormat("yyyy-MM-dd")
+        layout.addWidget(date_edit)
+        
+        # Current path display
+        base_path = router.get_noritsu_base()
+        current_path = router.get_noritsu_root()
+        current_label = QLabel(f"Current: {current_path}")
+        current_label.setWordWrap(True)
+        layout.addWidget(current_label)
+        
+        # Preview new path
+        preview_label = QLabel("")
+        preview_label.setWordWrap(True)
+        preview_label.setStyleSheet("color: #0066cc; font-weight: bold;")
+        layout.addWidget(preview_label)
+        
+        def update_preview():
+            selected_date = date_edit.date()
+            date_str = selected_date.toString("yyyyMMdd")
+            # Use os.path.join to handle path separators correctly (Windows uses \)
+            import os
+            if base_path:
+                # Preserve UNC path format if it starts with \\
+                if base_path.startswith("\\\\"):
+                    new_path = f"{base_path}\\{date_str}"
+                else:
+                    new_path = os.path.join(base_path, date_str)
+            else:
+                new_path = date_str
+            preview_label.setText(f"New path: {new_path}")
+        
+        date_edit.dateChanged.connect(update_preview)
+        update_preview()  # Initial preview
+        
+        # Buttons
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        
+        if dialog.exec() == QDialog.Accepted:
+            selected_date = date_edit.date()
+            date_str = selected_date.toString("yyyyMMdd")
+            # Use os.path.join to handle path separators correctly
+            import os
+            if base_path:
+                # Preserve UNC path format if it starts with \\
+                if base_path.startswith("\\\\"):
+                    new_path = f"{base_path}\\{date_str}"
+                else:
+                    new_path = os.path.join(base_path, date_str)
+            else:
+                new_path = date_str
+            
+            # Try to set the new path
+            if router.set_noritsu_root(new_path):
+                self.log_message(f"Changed scanner path to: {new_path}", "SUCCESS")
+                # Worker will pick up the change automatically
+            else:
+                QMessageBox.warning(self, "Invalid Path", 
+                                  f"Cannot access path:\n{new_path}\n\nPlease check the path exists.")
     
     def create_menu_bar(self):
         """Create the menu bar"""
@@ -437,6 +552,23 @@ class ScannerRouterGUI(QMainWindow):
         
         controls_group.setLayout(controls_layout)
         layout.addWidget(controls_group)
+        
+        # Scanner Path Group
+        path_group = QGroupBox("Scanner Path")
+        path_layout = QVBoxLayout()
+        
+        self.scan_path_label = QLabel("")
+        self.scan_path_label.setFont(QFont("Arial", 9))
+        self.scan_path_label.setWordWrap(True)
+        self.scan_path_label.setStyleSheet("color: #000000;")
+        path_layout.addWidget(self.scan_path_label)
+        
+        change_path_btn = QPushButton("Change Date")
+        change_path_btn.clicked.connect(self.change_scan_date)
+        path_layout.addWidget(change_path_btn)
+        
+        path_group.setLayout(path_layout)
+        layout.addWidget(path_group)
         
         # Recent Scans Group
         scans_group = QGroupBox("Recent Scans")

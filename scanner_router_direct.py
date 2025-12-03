@@ -32,16 +32,42 @@ DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN")
 DROPBOX_APP_KEY = os.getenv("DROPBOX_APP_KEY")
 DROPBOX_APP_SECRET = os.getenv("DROPBOX_APP_SECRET")
 DROPBOX_ROOT = os.getenv("DROPBOX_ROOT", "/Orders")
-NORITSU_ROOT = os.getenv("NORITSU_ROOT")
+NORITSU_ROOT_BASE = os.getenv("NORITSU_ROOT", "")
+NORITSU_ROOT = NORITSU_ROOT_BASE  # Can be changed dynamically
 LAB_NAME = os.getenv("LAB_NAME", "Noritsu")
+
+# Lock for changing NORITSU_ROOT
+_noritsu_root_lock = threading.Lock()
+
+def set_noritsu_root(new_path: str) -> bool:
+    """Set the NORITSU_ROOT path dynamically"""
+    global NORITSU_ROOT
+    try:
+        test_path = Path(new_path)
+        if not test_path.exists():
+            return False
+        with _noritsu_root_lock:
+            NORITSU_ROOT = new_path
+        return True
+    except Exception:
+        return False
+
+def get_noritsu_root() -> str:
+    """Get current NORITSU_ROOT path"""
+    with _noritsu_root_lock:
+        return NORITSU_ROOT
+
+def get_noritsu_base() -> str:
+    """Get base NORITSU_ROOT path (without date)"""
+    return NORITSU_ROOT_BASE
 SETTLE_SECONDS = float(os.getenv("SETTLE_SECONDS", "0.5"))
 # How often (seconds) to check the watch directory for new folders
 SCAN_INTERVAL = float(os.getenv("SCAN_INTERVAL", "2"))
 CUSTOMER_LINK_FIELD_NS = os.getenv("CUSTOMER_LINK_FIELD_NS", "custom_fields")
 CUSTOMER_LINK_FIELD_KEY = os.getenv("CUSTOMER_LINK_FIELD_KEY", "dropbox")
 
-assert SHOPIFY_SHOP and SHOPIFY_ADMIN_TOKEN and NORITSU_ROOT, \
-    "Missing required .env entries"
+assert SHOPIFY_SHOP and SHOPIFY_ADMIN_TOKEN and NORITSU_ROOT_BASE, \
+    "Missing required .env entries (SHOPIFY_SHOP, SHOPIFY_ADMIN_TOKEN, NORITSU_ROOT)"
 
 # Refresh token mode: need either token or refresh token setup
 assert DROPBOX_TOKEN or (DROPBOX_REFRESH_TOKEN and DROPBOX_APP_KEY and DROPBOX_APP_SECRET), \
