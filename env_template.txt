@@ -1,0 +1,31 @@
+# Scanner Router Environment Variables
+# Copy this file to .env and fill in your values
+
+# Shopify Configuration
+SHOPIFY_SHOP=your-shop-name.myshopify.com
+SHOPIFY_ADMIN_TOKEN=your_shopify_admin_token_here
+
+# Dropbox Configuration (choose one method)
+
+# Method 1: Refresh Token (Recommended - auto-refreshes)
+DROPBOX_APP_KEY=your_dropbox_app_key
+DROPBOX_APP_SECRET=your_dropbox_app_secret
+DROPBOX_REFRESH_TOKEN=your_dropbox_refresh_token
+
+# Method 2: Simple Token (Backup - expires every 4 hours)
+# DROPBOX_TOKEN=your_dropbox_token_here
+
+# Scanner Configuration
+NORITSU_ROOT=\\MPL-SVR01\Shared\NORITSU
+# Or if mapped to a drive: NORITSU_ROOT=Z:\NORITSU
+
+# Dropbox Root Folder
+DROPBOX_ROOT=/Orders
+
+# Optional Settings
+LAB_NAME=Noritsu
+SETTLE_SECONDS=0.5
+SCAN_INTERVAL=2
+CUSTOMER_LINK_FIELD_NS=custom_fields
+CUSTOMER_LINK_FIELD_KEY=dropbox
+
