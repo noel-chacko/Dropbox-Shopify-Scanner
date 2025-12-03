@@ -435,7 +435,43 @@ def ensure_customer_order_folder(order_node: Dict[str, Any]) -> Tuple[str, str]:
 
     # Fallback: default to standard DROPBOX_ROOT/email
     if not root_path:
-        root_path = f"{DROPBOX_ROOT}/{email}"
+        global _detected_team_base
+        
+        # Use DROPBOX_ROOT from env, but if it's just "/Orders", try to detect team folder base
+        dropbox_base = DROPBOX_ROOT
+        
+        # If we have a cached detected team base, use it
+        if _detected_team_base:
+            dropbox_base = _detected_team_base
+        elif dropbox_base == "/Orders":
+            # Try to detect team folder base by extracting it from existing customer paths
+            # Look for any existing customer folder in the team structure
+            try:
+                refresh_dbx_if_needed()
+                # Common team folder patterns
+                team_base_candidates = [
+                    "/work/PhotoLounge Rittenhouse/Orders",
+                    "/work/PhotoLounge%20Rittenhouse/Orders",
+                ]
+                
+                for candidate in team_base_candidates:
+                    try:
+                        # Check if this path exists
+                        DBX.files_get_metadata(candidate)
+                        _detected_team_base = candidate
+                        dropbox_base = candidate
+                        print(f"ℹ️  Detected team folder base: {dropbox_base}")
+                        break
+                    except ApiError:
+                        continue
+                
+                # If detection failed, cache None to avoid repeated attempts
+                if not _detected_team_base:
+                    _detected_team_base = DROPBOX_ROOT  # Cache the default to avoid retrying
+            except Exception as e:
+                print(f"⚠️  Could not detect team folder base: {e}, using default {DROPBOX_ROOT}")
+        
+        root_path = f"{dropbox_base}/{email}"
         ensure_tree(root_path)
 
         link = make_shared_link(root_path)
