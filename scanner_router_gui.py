@@ -789,7 +789,7 @@ class ScannerRouterGUI(QMainWindow):
     
     def set_order(self):
         """Set the order from the input field"""
-        # If we have a pending order confirmation, confirm it (even if input is empty)
+        # If we have a pending order confirmation, confirm it immediately (no delay)
         if self.pending_order_info:
             order_input = self.pending_order_info["order_input"]
             self.pending_order_info = None
@@ -797,8 +797,8 @@ class ScannerRouterGUI(QMainWindow):
             self.order_input.setPlaceholderText("Enter order number (e.g., 12345 or 12345s)")
             self.order_input.setEnabled(False)  # Disable input while processing
             self.log_message(f"Setting order: {order_input}...", "INFO")
-            # Set the order in background thread
-            QTimer.singleShot(0, lambda: self.order_worker.set_order(order_input))
+            # Set the order immediately (no timer delay for faster response)
+            self.order_worker.set_order(order_input)
             return
         
         # Otherwise, get input and search for the order
@@ -819,7 +819,11 @@ class ScannerRouterGUI(QMainWindow):
         order_no = order_info["order_no"]
         email = order_info["email"]
         
-        # Re-enable input
+        # Strip any leading '#' from order_no to avoid double #
+        if order_no.startswith("#"):
+            order_no = order_no[1:]
+        
+        # Re-enable input immediately
         self.order_input.setEnabled(True)
         
         # Store pending order info
