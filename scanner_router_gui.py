@@ -98,15 +98,33 @@ class ScannerWorker(QThread):
                     if scan_dir.name in self.existing_folders:
                         continue
                     
-                    # Process scan (this will trigger callbacks)
+                    # Found a new folder - process it
+                    # process_scan will handle STATE checks and readiness checks
                     try:
+                        # Log that we found a new folder
+                        self.status_update.emit(f"🔍 Found new folder: {scan_dir.name}")
+                        
+                        # Check if already in STATE (already processed)
+                        if router.STATE.get(scan_dir.name):
+                            # Already processed, mark as seen
+                            self.existing_folders.add(scan_dir.name)
+                            continue
+                        
+                        # Process scan (it will check readiness internally)
                         router.process_scan(scan_dir)
+                        
+                        # After processing, check if it's now in STATE (successfully processed)
+                        # If so, mark as seen. If not, it wasn't ready and we'll check again next time.
+                        if router.STATE.get(scan_dir.name):
+                            self.existing_folders.add(scan_dir.name)
                     except Exception as scan_error:
                         # Log full traceback for scan processing errors
                         error_trace = traceback.format_exc()
                         log_error_to_file(f"Processing Scan: {scan_dir.name}", error_trace)
                         # Emit error signal
                         self.error_occurred.emit(f"Processing Scan: {scan_dir.name}", f"{str(scan_error)}\n\nFull traceback logged to error log file.")
+                        # Mark as seen even on error to avoid infinite retry loops
+                        self.existing_folders.add(scan_dir.name)
                     
             except Exception as e:
                 # Log full traceback to file
