@@ -57,18 +57,26 @@ if errorlevel 1 (
     echo Installing required packages...
     echo This may take a few minutes...
     echo.
+    REM Try installing all requirements first
     %PYTHON_CMD% -m pip install -r requirements.txt
     if errorlevel 1 (
         echo.
-        echo ========================================
-        echo Error installing packages
-        echo ========================================
+        echo Some packages failed to install, trying essential packages only...
         echo.
-        echo Please run this command manually:
-        echo %PYTHON_CMD% -m pip install -r requirements.txt
-        echo.
-        pause
-        exit /b 1
+        REM If full requirements fail, install essential packages individually
+        %PYTHON_CMD% -m pip install PySide6 dropbox python-dotenv tenacity requests
+        if errorlevel 1 (
+            echo.
+            echo ========================================
+            echo Error installing packages
+            echo ========================================
+            echo.
+            echo Please run this command manually:
+            echo %PYTHON_CMD% -m pip install PySide6
+            echo.
+            pause
+            exit /b 1
+        )
     )
     echo.
     echo Packages installed successfully!
