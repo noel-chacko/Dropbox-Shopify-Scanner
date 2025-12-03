@@ -606,6 +606,17 @@ class ScannerRouterGUI(QMainWindow):
         """)
         controls_layout.addWidget(self.order_input)
         
+        # Confirmation message label (shown when order is found, waiting for confirmation)
+        self.order_confirm_label = QLabel("")
+        self.order_confirm_label.setFont(QFont("Arial", 12, QFont.Bold))
+        self.order_confirm_label.setStyleSheet("color: #000000;")
+        self.order_confirm_label.setAlignment(Qt.AlignCenter)
+        self.order_confirm_label.setWordWrap(True)
+        # Enable HTML formatting for the label
+        self.order_confirm_label.setTextFormat(Qt.TextFormat.RichText)  # Enable HTML formatting
+        self.order_confirm_label.hide()  # Hidden by default
+        controls_layout.addWidget(self.order_confirm_label)
+        
         self.set_order_btn = QPushButton("Set Order")
         self.set_order_btn.clicked.connect(self.set_order)
         # Make button bigger
@@ -802,6 +813,7 @@ class ScannerRouterGUI(QMainWindow):
             self.pending_order_info = None
             self.order_input.clear()
             self.order_input.setPlaceholderText("Enter order number (e.g., 12345 or 12345s)")
+            self.order_confirm_label.hide()  # Hide confirmation message
             self.order_input.setEnabled(False)  # Disable input while processing
             self.log_message(f"Setting order: {order_input}...", "INFO")
             # Set the order immediately (no timer delay for faster response)
@@ -842,7 +854,13 @@ class ScannerRouterGUI(QMainWindow):
         self.log_message(confirm_msg, "SUCCESS")
         
         # Update placeholder to show confirmation needed (plain text for placeholder)
-        self.order_input.setPlaceholderText(f"Found: #{order_no} ({email}) - Press Enter to confirm")
+        self.order_input.setPlaceholderText(f"Found: #{order_no} ({email})")
+        
+        # Show styled confirmation message below input field
+        confirm_text = f"<span style='color: black; font-weight: bold; text-decoration: underline;'>Press Enter to confirm</span>"
+        self.order_confirm_label.setText(confirm_text)
+        self.order_confirm_label.show()
+        
         self.order_input.clear()  # Clear the input so they can just press Enter
         self.order_input.setFocus()  # Keep focus so Enter works immediately
     
@@ -850,6 +868,7 @@ class ScannerRouterGUI(QMainWindow):
         """Handle when order is not found - show warning on main thread"""
         self.order_input.setEnabled(True)
         self.order_input.setPlaceholderText("Enter order number (e.g., 12345 or 12345s)")
+        self.order_confirm_label.hide()  # Hide confirmation message
         self.log_message(f"❌ No order found for: {order_input}", "ERROR")
         QMessageBox.warning(self, "Order Not Found", f"No order found matching: {order_input}")
     
@@ -961,6 +980,7 @@ class ScannerRouterGUI(QMainWindow):
         # Re-enable input
         self.order_input.setEnabled(True)
         self.order_input.setPlaceholderText("Enter order number (e.g., 12345 or 12345s)")
+        self.order_confirm_label.hide()  # Hide confirmation message
         
         if not success:
             self.log_message(f"❌ Failed to set order: {order_input}", "ERROR")
