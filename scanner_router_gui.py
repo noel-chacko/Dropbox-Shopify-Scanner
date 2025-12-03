@@ -570,6 +570,8 @@ class ScannerRouterGUI(QMainWindow):
         tags_buttons_layout.addWidget(self.apply_tags_btn)
         
         order_layout.addLayout(tags_buttons_layout)
+        self.apply_tags_btn.hide()  # Hide initially (only show when tags exist)
+        # Change Tags button is always visible but disabled until order is set
         
         self.order_dropbox_label = QLabel("")
         self.order_dropbox_label.setWordWrap(True)
@@ -774,12 +776,15 @@ class ScannerRouterGUI(QMainWindow):
                 self.pending_tags_label.setVisible(True)
                 self.change_tags_btn.setEnabled(True)
                 self.apply_tags_btn.setEnabled(True)
+                self.apply_tags_btn.setVisible(True)
             else:
                 self.order_status_label.setText("Ready")
                 self.pending_tags_label.setText("")
                 self.pending_tags_label.setVisible(False)
-                self.change_tags_btn.setEnabled(False)
+                # Change Tags button is always enabled when order is set (even without tags)
+                self.change_tags_btn.setEnabled(True)
                 self.apply_tags_btn.setEnabled(False)
+                self.apply_tags_btn.setVisible(False)
             
             dropbox_path = order.get("dropbox_order_path", "")
             if dropbox_path:
