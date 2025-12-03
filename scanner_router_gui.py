@@ -508,6 +508,35 @@ class ScannerRouterGUI(QMainWindow):
         self.pending_tags_label.setWordWrap(True)
         order_layout.addWidget(self.pending_tags_label)
         
+        # Tags buttons layout
+        tags_buttons_layout = QHBoxLayout()
+        
+        # Change tags button
+        self.change_tags_btn = QPushButton("Change Tags")
+        self.change_tags_btn.clicked.connect(self.change_pending_tags)
+        self.change_tags_btn.setFont(QFont("Arial", 11, QFont.Bold))
+        self.change_tags_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #c0c0c0;
+                color: #000000;
+                border: 2px solid #808080;
+                padding: 8px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #b0b0b0;
+            }
+            QPushButton:pressed {
+                background-color: #a0a0a0;
+            }
+            QPushButton:disabled {
+                background-color: #e0e0e0;
+                color: #808080;
+            }
+        """)
+        self.change_tags_btn.setEnabled(False)  # Disabled by default
+        tags_buttons_layout.addWidget(self.change_tags_btn)
+        
         # Apply tags button
         self.apply_tags_btn = QPushButton("Apply Pending Tags")
         self.apply_tags_btn.clicked.connect(self.apply_pending_tags)
@@ -532,7 +561,9 @@ class ScannerRouterGUI(QMainWindow):
             }
         """)
         self.apply_tags_btn.setEnabled(False)  # Disabled by default
-        order_layout.addWidget(self.apply_tags_btn)
+        tags_buttons_layout.addWidget(self.apply_tags_btn)
+        
+        order_layout.addLayout(tags_buttons_layout)
         
         self.order_dropbox_label = QLabel("")
         self.order_dropbox_label.setWordWrap(True)
@@ -707,6 +738,7 @@ class ScannerRouterGUI(QMainWindow):
             self.order_dropbox_label.setText("")
             self.pending_tags_label.setText("")
             self.pending_tags_label.setVisible(False)
+            self.change_tags_btn.setEnabled(False)
             self.apply_tags_btn.setEnabled(False)
             return
         
@@ -717,6 +749,7 @@ class ScannerRouterGUI(QMainWindow):
             self.order_dropbox_label.setText(f"Dropbox: {router.DROPBOX_ROOT}/_staging/")
             self.pending_tags_label.setText("")
             self.pending_tags_label.setVisible(False)
+            self.change_tags_btn.setEnabled(False)
             self.apply_tags_btn.setEnabled(False)
         else:
             order_no = order.get("order_no", "Unknown")
@@ -733,11 +766,13 @@ class ScannerRouterGUI(QMainWindow):
                 tags_display = f"Pending Tags: {', '.join(pending_tags)}"
                 self.pending_tags_label.setText(tags_display)
                 self.pending_tags_label.setVisible(True)
+                self.change_tags_btn.setEnabled(True)
                 self.apply_tags_btn.setEnabled(True)
             else:
                 self.order_status_label.setText("Ready")
                 self.pending_tags_label.setText("")
                 self.pending_tags_label.setVisible(False)
+                self.change_tags_btn.setEnabled(False)
                 self.apply_tags_btn.setEnabled(False)
             
             dropbox_path = order.get("dropbox_order_path", "")
@@ -799,6 +834,64 @@ class ScannerRouterGUI(QMainWindow):
         self.log_message(f"❌ No order found for: {order_input}", "ERROR")
         QMessageBox.warning(self, "Order Not Found", f"No order found matching: {order_input}")
     
+    def change_pending_tags(self):
+        """Change the pending tags for the current order"""
+        with router.order_lock:
+            order = router.current_order_data
+        
+        if not order or not isinstance(order, dict):
+            QMessageBox.warning(self, "No Order", "No order is currently set.")
+            return
+        
+        current_tags = order.get("pending_tags", [])
+        order_no = order.get("order_no", "Unknown")
+        
+        # Create dialog to edit tags
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Change Tags for Order #{order_no}")
+        dialog.setMinimumWidth(400)
+        
+        layout = QVBoxLayout()
+        dialog.setLayout(layout)
+        
+        # Instructions
+        info_label = QLabel("Enter tags separated by commas (e.g., urgent, rush, special):")
+        layout.addWidget(info_label)
+        
+        # Tags input
+        tags_input = QLineEdit(", ".join(current_tags))
+        tags_input.setPlaceholderText("e.g., urgent, rush, special")
+        layout.addWidget(tags_input)
+        
+        # Buttons
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        
+        if dialog.exec() == QDialog.Accepted:
+            tags_text = tags_input.text().strip()
+            if tags_text:
+                # Parse tags (split by comma, strip whitespace)
+                new_tags = [t.strip() for t in tags_text.split(",") if t.strip()]
+            else:
+                new_tags = []
+            
+            # Update pending tags
+            with router.order_lock:
+                if router.current_order_data and isinstance(router.current_order_data, dict):
+                    if new_tags:
+                        router.current_order_data["pending_tags"] = new_tags
+                    else:
+                        router.current_order_data.pop("pending_tags", None)
+            
+            if new_tags:
+                self.log_message(f"Changed pending tags to: {', '.join(new_tags)}", "INFO")
+            else:
+                self.log_message("Cleared pending tags", "INFO")
+            
+            self.refresh_order_info()  # Update display
+    
     def apply_pending_tags(self):
         """Apply pending tags to the current order"""
         with router.order_lock:
@@ -822,6 +915,7 @@ class ScannerRouterGUI(QMainWindow):
         
         # Apply tags
         self.apply_tags_btn.setEnabled(False)
+        self.change_tags_btn.setEnabled(False)
         self.log_message(f"Applying tags to order #{order_no}: {', '.join(pending_tags)}", "INFO")
         
         try:
@@ -837,9 +931,11 @@ class ScannerRouterGUI(QMainWindow):
             else:
                 self.log_message(f"❌ Failed to apply tags", "ERROR")
                 self.apply_tags_btn.setEnabled(True)
+                self.change_tags_btn.setEnabled(True)
         except Exception as e:
             self.log_message(f"❌ Error applying tags: {e}", "ERROR")
             self.apply_tags_btn.setEnabled(True)
+            self.change_tags_btn.setEnabled(True)
     
     def on_order_set_result(self, success: bool, order_input: str):
         """Handle order set result - show message on main thread"""
