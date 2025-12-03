@@ -464,14 +464,44 @@ class ScannerRouterGUI(QMainWindow):
                          "Automatically routes scanner output to customer Dropbox folders.")
     
     def setup_callbacks(self):
-        """Setup callbacks for the router module"""
-        router.gui_callbacks['order_changed'] = self.on_order_changed
-        router.gui_callbacks['scan_detected'] = self.on_scan_detected
-        router.gui_callbacks['upload_started'] = self.on_upload_started
-        router.gui_callbacks['upload_progress'] = self.on_upload_progress
-        router.gui_callbacks['upload_completed'] = self.on_upload_completed
-        router.gui_callbacks['error'] = self.on_error
-        router.gui_callbacks['status'] = self.on_status
+        """Setup callbacks for the router module - all wrapped for thread safety"""
+        def safe_callback(callback_func):
+            """Wrap callback to ensure it runs on main thread and catches exceptions"""
+            def wrapper(*args, **kwargs):
+                try:
+                    # Capture args/kwargs in closure
+                    captured_args = args
+                    captured_kwargs = kwargs
+                    callback_name = callback_func.__name__
+                    
+                    def safe_execute():
+                        """Execute callback with exception handling"""
+                        try:
+                            callback_func(*captured_args, **captured_kwargs)
+                        except Exception as e:
+                            error_trace = traceback.format_exc()
+                            log_error_to_file(f"Callback Execution: {callback_name}", error_trace)
+                            # Try to show error in GUI
+                            try:
+                                self.log_message(f"Error in callback {callback_name}: {str(e)}", "ERROR")
+                            except:
+                                pass  # If we can't even log, just continue
+                    
+                    # Use QTimer to ensure execution on main thread
+                    QTimer.singleShot(0, safe_execute)
+                except Exception as e:
+                    error_trace = traceback.format_exc()
+                    log_error_to_file(f"Callback Wrapper: {callback_func.__name__}", error_trace)
+            
+            return wrapper
+        
+        router.gui_callbacks['order_changed'] = safe_callback(self.on_order_changed)
+        router.gui_callbacks['scan_detected'] = safe_callback(self.on_scan_detected)
+        router.gui_callbacks['upload_started'] = safe_callback(self.on_upload_started)
+        router.gui_callbacks['upload_progress'] = safe_callback(self.on_upload_progress)
+        router.gui_callbacks['upload_completed'] = safe_callback(self.on_upload_completed)
+        router.gui_callbacks['error'] = safe_callback(self.on_error)
+        router.gui_callbacks['status'] = safe_callback(self.on_status)
     
     def init_ui(self):
         """Initialize the UI"""
@@ -1061,39 +1091,63 @@ class ScannerRouterGUI(QMainWindow):
     
     def on_scan_detected(self, scan_name: str, order: Dict[str, Any]):
         """Callback when a scan is detected"""
-        self.log_message(f"📷 Scan detected: {scan_name}", "INFO")
-        self.add_scan_to_table(scan_name, "Detected", 0, datetime.now())
+        try:
+            self.log_message(f"📷 Scan detected: {scan_name}", "INFO")
+            self.add_scan_to_table(scan_name, "Detected", 0, datetime.now())
+        except Exception as e:
+            error_trace = traceback.format_exc()
+            log_error_to_file("on_scan_detected", error_trace)
+            self.log_message(f"Error in scan detection: {str(e)}", "ERROR")
     
     def on_upload_started(self, scan_name: str, dest: str):
         """Callback when upload starts"""
-        self.log_message(f"📤 Starting upload: {scan_name} → {dest}", "INFO")
-        self.current_upload_label.setText(f"Uploading: {scan_name}")
-        self.progress_bar.setValue(0)
-        self.progress_status_label.setText("Initializing...")
-        self.update_scan_status(scan_name, "Uploading", 0)
+        try:
+            self.log_message(f"📤 Starting upload: {scan_name} → {dest}", "INFO")
+            self.current_upload_label.setText(f"Uploading: {scan_name}")
+            self.progress_bar.setValue(0)
+            self.progress_status_label.setText("Initializing...")
+            self.update_scan_status(scan_name, "Uploading", 0)
+        except Exception as e:
+            error_trace = traceback.format_exc()
+            log_error_to_file("on_upload_started", error_trace)
+            self.log_message(f"Error in upload start: {str(e)}", "ERROR")
     
     def on_upload_progress(self, scan_name: str, current: int, total: int, message: str):
         """Callback for upload progress"""
-        if total > 0:
-            percent = int((current / total) * 100)
-            self.progress_bar.setValue(percent)
-            self.progress_status_label.setText(f"{current}/{total} files - {message}")
-        else:
-            self.progress_status_label.setText(message)
+        try:
+            if total > 0:
+                percent = int((current / total) * 100)
+                self.progress_bar.setValue(percent)
+                self.progress_status_label.setText(f"{current}/{total} files - {message}")
+            else:
+                self.progress_status_label.setText(message)
+        except Exception as e:
+            error_trace = traceback.format_exc()
+            log_error_to_file("on_upload_progress", error_trace)
+            # Don't spam errors for progress updates
     
     def on_upload_completed(self, scan_name: str, file_count: int, dest: str):
         """Callback when upload completes"""
-        self.log_message(f"✅ Upload completed: {scan_name} ({file_count} files)", "SUCCESS")
-        self.current_upload_label.setText("No active upload")
-        self.progress_bar.setValue(100)
-        self.progress_status_label.setText(f"Completed: {file_count} files uploaded")
+        try:
+            self.log_message(f"✅ Upload completed: {scan_name} ({file_count} files)", "SUCCESS")
+            self.current_upload_label.setText("No active upload")
+            self.progress_bar.setValue(100)
+            self.progress_status_label.setText(f"Completed: {file_count} files uploaded")
+        except Exception as e:
+            error_trace = traceback.format_exc()
+            log_error_to_file("on_upload_completed", error_trace)
+            self.log_message(f"Error in upload completion: {str(e)}", "ERROR")
         self.update_scan_status(scan_name, "Completed", file_count)
         # Reset progress bar after a delay
         QTimer.singleShot(3000, lambda: self.progress_bar.setValue(0))
     
     def on_error(self, scan_name: str, error_msg: str):
         """Callback for errors"""
-        self.log_message(f"❌ Error: {scan_name} - {error_msg}", "ERROR")
+        try:
+            self.log_message(f"❌ Error: {scan_name} - {error_msg}", "ERROR")
+        except Exception as e:
+            error_trace = traceback.format_exc()
+            log_error_to_file("on_error", error_trace)
         self.update_scan_status(scan_name, "Error", 0)
     
     def add_scan_to_table(self, scan_name: str, status: str, file_count: int, timestamp: datetime):
@@ -1161,7 +1215,7 @@ def exception_handler(exc_type, exc_value, exc_traceback):
         return
     
     error_msg = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
-    log_error_to_file("Unhandled Exception", error_msg)
+    log_error_to_file("Unhandled Exception (Main Thread)", error_msg)
     
     # Also print to stderr
     print("="*80, file=sys.stderr)
@@ -1171,23 +1225,53 @@ def exception_handler(exc_type, exc_value, exc_traceback):
     print(f"\nFull error details saved to: {ERROR_LOG_FILE}", file=sys.stderr)
     print("="*80, file=sys.stderr)
 
+def qt_exception_handler(msg_type, context, message):
+    """Qt-specific exception handler"""
+    try:
+        error_msg = f"Qt Exception ({msg_type}): {message}\n"
+        error_msg += f"Context: {context}\n"
+        log_error_to_file("Qt Exception", error_msg)
+    except:
+        pass  # If logging fails, at least try to print
+    print(f"Qt Exception: {message}", file=sys.stderr)
+
 def main():
     # Set up global exception handler
     sys.excepthook = exception_handler
     
     app = QApplication(sys.argv)
     
+    # Set up Qt exception handler
+    from PySide6.QtCore import qInstallMessageHandler, QtMsgType
+    qInstallMessageHandler(qt_exception_handler)
+    
     # Log startup
-    log_error_to_file("Application", "Application started")
+    try:
+        log_error_to_file("Application", "Application started")
+    except Exception as e:
+        print(f"Failed to log startup: {e}", file=sys.stderr)
     
-    window = ScannerRouterGUI()
-    window.show()
+    try:
+        window = ScannerRouterGUI()
+        window.show()
+        
+        # Show error log location on startup
+        if ERROR_LOG_FILE.exists():
+            window.log_message(f"📄 Error log file: {ERROR_LOG_FILE}", "INFO")
+    except Exception as e:
+        error_trace = traceback.format_exc()
+        log_error_to_file("Window Creation", error_trace)
+        print(f"Failed to create window: {e}", file=sys.stderr)
+        print(f"Full traceback saved to: {ERROR_LOG_FILE}", file=sys.stderr)
+        sys.exit(1)
     
-    # Show error log location on startup
-    if ERROR_LOG_FILE.exists():
-        window.log_message(f"📄 Error log file: {ERROR_LOG_FILE}", "INFO")
-    
-    sys.exit(app.exec())
+    try:
+        sys.exit(app.exec())
+    except Exception as e:
+        error_trace = traceback.format_exc()
+        log_error_to_file("Application Exit", error_trace)
+        print(f"Application exit error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
