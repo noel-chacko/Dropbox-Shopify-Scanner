@@ -81,7 +81,14 @@ For a native macOS app experience:
 ### "Command not found" or "Python not found"
 - Make sure Python 3 is installed
 - On macOS: `brew install python3` or download from python.org
-- On Windows: Download from python.org and check "Add to PATH" during installation
+- On Windows: 
+  - Download Python 3 from https://www.python.org/downloads/
+  - **IMPORTANT:** During installation, check "Add Python to PATH"
+  - If Python is already installed but not in PATH:
+    1. Search for "Environment Variables" in Windows
+    2. Edit "Path" variable
+    3. Add your Python installation folder (usually `C:\Python3x` or `C:\Users\YourName\AppData\Local\Programs\Python\Python3x`)
+    4. Restart Command Prompt and try again
 
 ### "Module not found" errors
 - Run: `pip install -r requirements.txt`
