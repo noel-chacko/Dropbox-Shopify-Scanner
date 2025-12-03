@@ -25,16 +25,146 @@ load_dotenv()
 SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP")
 SHOPIFY_ADMIN_TOKEN = os.getenv("SHOPIFY_ADMIN_TOKEN")
 DROPBOX_TOKEN = os.getenv("DROPBOX_TOKEN")
+DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN")
+DROPBOX_APP_KEY = os.getenv("DROPBOX_APP_KEY")
+DROPBOX_APP_SECRET = os.getenv("DROPBOX_APP_SECRET")
 DROPBOX_ROOT = os.getenv("DROPBOX_ROOT", "/Orders")
 # Note: You can override these in .env file, but default is custom_fields.dropbox
 CUSTOMER_LINK_FIELD_NS = os.getenv("CUSTOMER_LINK_FIELD_NS", "custom_fields")
 CUSTOMER_LINK_FIELD_KEY = os.getenv("CUSTOMER_LINK_FIELD_KEY", "dropbox")
 
-assert SHOPIFY_SHOP and SHOPIFY_ADMIN_TOKEN and DROPBOX_TOKEN, \
-    "Missing required .env entries (SHOPIFY_SHOP, SHOPIFY_ADMIN_TOKEN, DROPBOX_TOKEN)."
+assert SHOPIFY_SHOP and SHOPIFY_ADMIN_TOKEN, \
+    "Missing required .env entries (SHOPIFY_SHOP, SHOPIFY_ADMIN_TOKEN)."
+
+# Refresh token mode: need either token or refresh token setup
+assert DROPBOX_TOKEN or (DROPBOX_REFRESH_TOKEN and DROPBOX_APP_KEY and DROPBOX_APP_SECRET), \
+    "Missing Dropbox credentials (need DROPBOX_TOKEN or DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET)"
+
+# =================== DROPBOX TOKEN MANAGEMENT ===================
+import json
+from pathlib import Path
+from dropbox.exceptions import AuthError
+
+TOKEN_FILE = Path(".dropbox_tokens.json")
+
+def load_tokens() -> Dict[str, Any]:
+    """Load tokens from file"""
+    if TOKEN_FILE.exists():
+        try:
+            with open(TOKEN_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_tokens(access_token: str, expires_in: int = 14400):
+    """Save tokens to file"""
+    tokens = {
+        "access_token": access_token,
+        "expires_at": time.time() + expires_in
+    }
+    if DROPBOX_REFRESH_TOKEN:
+        tokens["refresh_token"] = DROPBOX_REFRESH_TOKEN
+    try:
+        with open(TOKEN_FILE, 'w') as f:
+            json.dump(tokens, f)
+    except Exception as e:
+        print(f"⚠️  Warning: Could not save tokens: {e}")
+
+def refresh_access_token() -> Optional[str]:
+    """Refresh access token using refresh token"""
+    if not DROPBOX_REFRESH_TOKEN or not DROPBOX_APP_KEY or not DROPBOX_APP_SECRET:
+        return None
+    
+    try:
+        response = requests.post(
+            "https://api.dropbox.com/oauth2/token",
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": DROPBOX_REFRESH_TOKEN,
+                "client_id": DROPBOX_APP_KEY,
+                "client_secret": DROPBOX_APP_SECRET,
+            },
+            timeout=30
+        )
+        response.raise_for_status()
+        tokens = response.json()
+        access_token = tokens.get("access_token")
+        expires_in = tokens.get("expires_in", 14400)
+        
+        if access_token:
+            save_tokens(access_token, expires_in)
+            return access_token
+    except Exception as e:
+        print(f"⚠️  Error refreshing token: {e}")
+        return None
+    
+    return None
+
+def get_dropbox_client():
+    """Get or create Dropbox client with automatic token refresh"""
+    # Try to load from file first (preferred)
+    tokens = load_tokens()
+    access_token = tokens.get("access_token")
+    expires_at = tokens.get("expires_at", 0)
+    
+    # Check if saved token is still valid (refresh 1 hour before expiry)
+    if access_token and time.time() < (expires_at - 3600):
+        try:
+            test_client = dropbox.Dropbox(access_token, timeout=10)
+            test_client.users_get_current_account()
+            return dropbox.Dropbox(access_token, timeout=120, max_retries_on_rate_limit=5)
+        except (ApiError, AuthError, Exception):
+            # Token expired or invalid, try to refresh
+            pass
+    
+    # Try to refresh token if we have refresh token
+    if DROPBOX_REFRESH_TOKEN:
+        new_token = refresh_access_token()
+        if new_token:
+            return dropbox.Dropbox(new_token, timeout=120, max_retries_on_rate_limit=5)
+    
+    # Fallback to environment token (may be expired, but will be refreshed on first use)
+    if DROPBOX_TOKEN:
+        try:
+            test_client = dropbox.Dropbox(DROPBOX_TOKEN, timeout=10)
+            test_client.users_get_current_account()
+            return dropbox.Dropbox(DROPBOX_TOKEN, timeout=120, max_retries_on_rate_limit=5)
+        except (ApiError, AuthError, Exception):
+            # Token expired, but we'll try to refresh on first API call
+            return dropbox.Dropbox(DROPBOX_TOKEN, timeout=120, max_retries_on_rate_limit=5)
+    
+    raise RuntimeError("Unable to get valid Dropbox access token. Need DROPBOX_TOKEN or DROPBOX_REFRESH_TOKEN")
+
+def refresh_dbx_if_needed():
+    """Refresh Dropbox client if token is expired"""
+    global DBX
+    try:
+        # Quick test to see if token works
+        DBX.users_get_current_account()
+    except AuthError as e:
+        # Check if it's an expired token error
+        error_str = str(e).lower()
+        error_reason = None
+        if hasattr(e, 'error'):
+            if hasattr(e.error, 'error'):
+                error_reason = str(e.error.error).lower()
+            elif hasattr(e.error, 'reason'):
+                error_reason = str(e.error.reason).lower()
+        
+        if 'expired' in error_str or 'expired_access_token' in error_str or (error_reason and 'expired' in error_reason):
+            print("🔄 Dropbox token expired, refreshing...")
+            new_client = get_dropbox_client()
+            if new_client:
+                DBX = new_client
+                print("✅ Dropbox token refreshed successfully")
+            else:
+                print("⚠️  Failed to refresh Dropbox token")
+    except Exception:
+        pass  # Other errors, don't refresh
 
 # =================== SETUP ===================
-DBX = dropbox.Dropbox(DROPBOX_TOKEN, timeout=120, max_retries_on_rate_limit=5)
+DBX = get_dropbox_client()
 SHOPIFY_GRAPHQL = f"https://{SHOPIFY_SHOP}/admin/api/2024-10/graphql.json"
 HDR = {"X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN, "Content-Type": "application/json"}
 
@@ -392,6 +522,7 @@ def set_customer_dropbox_link(customer_gid: str, url: str) -> bool:
 # =================== DROPBOX ===================
 def ensure_folder(path: str) -> None:
     """Create a single folder; ignore 'already exists' and races."""
+    refresh_dbx_if_needed()
     try:
         DBX.files_create_folder_v2(path, autorename=False)
     except ApiError:
@@ -421,10 +552,12 @@ def ensure_tree(full_path: str) -> None:
 
 def make_shared_link(path: str) -> Optional[str]:
     """Create or retrieve a shared link for a Dropbox path."""
+    refresh_dbx_if_needed()
     try:
         return DBX.sharing_create_shared_link_with_settings(path).url
     except ApiError:
         # Link already exists, get existing one
+        refresh_dbx_if_needed()
         links = DBX.sharing_list_shared_links(path=path).links
         return links[0].url if links else None
 
@@ -572,6 +705,7 @@ def create_customer_dropbox(email_or_order: str) -> None:
     print(f"\n📁 Creating Dropbox folder: {root_path}")
 
     # Check if folder exists and prompt for confirmation
+    refresh_dbx_if_needed()
     try:
         DBX.files_get_metadata(root_path)
         print("⚠️  This folder already exists!")
@@ -592,6 +726,7 @@ def create_customer_dropbox(email_or_order: str) -> None:
 
     if order_folder_number:
         order_folder_path = f"{root_path}/{order_folder_number}"
+        refresh_dbx_if_needed()
         try:
             DBX.files_get_metadata(order_folder_path)
             print(f"⚠️  Order folder already exists: {order_folder_path}")
