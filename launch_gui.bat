@@ -46,6 +46,35 @@ exit /b 1
 echo Found Python: %PYTHON_CMD%
 echo.
 
+REM Check if PySide6 is installed
+%PYTHON_CMD% -c "import PySide6" >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo ========================================
+    echo PySide6 is not installed
+    echo ========================================
+    echo.
+    echo Installing required packages...
+    echo This may take a few minutes...
+    echo.
+    %PYTHON_CMD% -m pip install -r requirements.txt
+    if errorlevel 1 (
+        echo.
+        echo ========================================
+        echo Error installing packages
+        echo ========================================
+        echo.
+        echo Please run this command manually:
+        echo %PYTHON_CMD% -m pip install -r requirements.txt
+        echo.
+        pause
+        exit /b 1
+    )
+    echo.
+    echo Packages installed successfully!
+    echo.
+)
+
 REM Run the GUI
 %PYTHON_CMD% scanner_router_gui.py
 
