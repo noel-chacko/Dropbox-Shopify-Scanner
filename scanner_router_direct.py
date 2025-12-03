@@ -424,14 +424,9 @@ def ensure_customer_order_folder(order_node: Dict[str, Any]) -> Tuple[str, str]:
             md = DBX.sharing_get_shared_link_metadata(existing_link)
             path = getattr(md, "path_display", None) or getattr(md, "path_lower", None)
             if path:
-                # Normalize path to use /Orders instead of /orders (case-insensitive)
-                path_lower = path.lower()
-                if path_lower.startswith("/orders/"):
-                    root_path = "/Orders" + path[7:]  # Replace /orders with /Orders
-                elif path_lower == "/orders":
-                    root_path = "/Orders"
-                else:
-                    root_path = path
+                # Use path exactly as Dropbox returns it (handles team folders automatically)
+                # path_display gives us the correct case and full path including team folders
+                root_path = path
                 print(f"ℹ️  Using customer's existing Dropbox root: {root_path}")
             else:
                 print(f"⚠️  Shared link exists but no path was available; falling back to default root for {email}")
