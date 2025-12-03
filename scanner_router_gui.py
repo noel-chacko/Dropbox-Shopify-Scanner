@@ -7,6 +7,7 @@ import sys
 import os
 import time
 import threading
+import traceback
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, Optional
@@ -23,6 +24,24 @@ from PySide6.QtGui import QFont, QColor, QFontDatabase, QIcon, QAction
 
 # Import the scanner router module
 import scanner_router_direct as router
+
+# Error log file
+ERROR_LOG_FILE = Path(__file__).parent / "scanner_router_errors.log"
+
+def log_error_to_file(source: str, error_msg: str):
+    """Log error to file with timestamp"""
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(ERROR_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*80}\n")
+            f.write(f"[{timestamp}] Error in {source}\n")
+            f.write(f"{'='*80}\n")
+            f.write(f"{error_msg}\n")
+            f.write(f"{'='*80}\n\n")
+    except Exception as e:
+        # If we can't write to log file, at least print it
+        print(f"Failed to write to error log: {e}")
+        print(f"Original error: {error_msg}")
 
 class ScannerWorker(QThread):
     """Worker thread that runs the scanner loop"""
@@ -80,10 +99,21 @@ class ScannerWorker(QThread):
                         continue
                     
                     # Process scan (this will trigger callbacks)
-                    router.process_scan(scan_dir)
+                    try:
+                        router.process_scan(scan_dir)
+                    except Exception as scan_error:
+                        # Log full traceback for scan processing errors
+                        error_trace = traceback.format_exc()
+                        log_error_to_file(f"Processing Scan: {scan_dir.name}", error_trace)
+                        # Emit error signal
+                        self.error_occurred.emit(f"Processing Scan: {scan_dir.name}", f"{str(scan_error)}\n\nFull traceback logged to error log file.")
                     
             except Exception as e:
-                self.error_occurred.emit("Scanner Loop", str(e))
+                # Log full traceback to file
+                error_trace = traceback.format_exc()
+                log_error_to_file("Scanner Loop", error_trace)
+                # Emit error signal with full traceback
+                self.error_occurred.emit("Scanner Loop", f"{str(e)}\n\nFull traceback logged to error log file.")
                 time.sleep(1)
     
     def stop(self):
@@ -1102,7 +1132,13 @@ class ScannerRouterGUI(QMainWindow):
     
     def show_error(self, source: str, error: str):
         """Show an error message"""
-        self.log_message(f"Error in {source}: {error}", "ERROR")
+        error_msg = f"Error in {source}: {error}"
+        self.log_message(error_msg, "ERROR")
+        # Also log to file
+        log_error_to_file(source, error)
+        # Show error log location in GUI
+        if ERROR_LOG_FILE.exists():
+            self.log_message(f"📄 Full error details saved to: {ERROR_LOG_FILE}", "INFO")
     
     def on_status(self, message: str):
         """Callback for status messages"""
@@ -1118,10 +1154,39 @@ class ScannerRouterGUI(QMainWindow):
             self.order_worker_thread.wait()
         event.accept()
 
+def exception_handler(exc_type, exc_value, exc_traceback):
+    """Global exception handler for unhandled exceptions"""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    
+    error_msg = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+    log_error_to_file("Unhandled Exception", error_msg)
+    
+    # Also print to stderr
+    print("="*80, file=sys.stderr)
+    print("UNHANDLED EXCEPTION", file=sys.stderr)
+    print("="*80, file=sys.stderr)
+    print(error_msg, file=sys.stderr)
+    print(f"\nFull error details saved to: {ERROR_LOG_FILE}", file=sys.stderr)
+    print("="*80, file=sys.stderr)
+
 def main():
+    # Set up global exception handler
+    sys.excepthook = exception_handler
+    
     app = QApplication(sys.argv)
+    
+    # Log startup
+    log_error_to_file("Application", "Application started")
+    
     window = ScannerRouterGUI()
     window.show()
+    
+    # Show error log location on startup
+    if ERROR_LOG_FILE.exists():
+        window.log_message(f"📄 Error log file: {ERROR_LOG_FILE}", "INFO")
+    
     sys.exit(app.exec())
 
 if __name__ == "__main__":
