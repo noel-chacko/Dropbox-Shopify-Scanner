@@ -103,6 +103,9 @@ def get_refresh_token():
     # Wait for callback
     print("2. Waiting for authorization...")
     print("   (Complete the authorization in your browser)")
+    print("\n   If the browser redirect doesn't work, you can manually copy the 'code'")
+    print("   parameter from the URL after authorization and paste it here.")
+    print("   The URL will look like: http://localhost:8080/callback?code=XXXXX\n")
     
     timeout = 120  # 2 minutes
     elapsed = 0
@@ -110,12 +113,23 @@ def get_refresh_token():
         import time
         time.sleep(1)
         elapsed += 1
+        # Show progress every 10 seconds
+        if elapsed % 10 == 0:
+            print(f"   Still waiting... ({elapsed}/{timeout} seconds)")
     
     server.shutdown()
     
     if CallbackHandler.auth_code is None:
-        print("\n❌ Authorization timeout or cancelled")
-        return None
+        print("\n❌ Authorization timeout or callback not received")
+        print("\n   You can manually enter the authorization code:")
+        print("   1. After authorizing, check the browser URL")
+        print("   2. Look for 'code=XXXXX' in the URL")
+        print("   3. Copy the code value and paste it below")
+        manual_code = input("\n   Enter authorization code (or press Enter to cancel): ").strip()
+        if manual_code:
+            CallbackHandler.auth_code = manual_code
+        else:
+            return None
     
     auth_code = CallbackHandler.auth_code
     print("✅ Authorization code received")
