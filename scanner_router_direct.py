@@ -393,7 +393,8 @@ def _extract_rate_limit_error(e: Exception) -> Optional[RateLimitError]:
 def ensure_folder(path: str) -> None:
     """Create a folder with retry logic for rate limits."""
     try:
-        # Only refresh token once at the start of ensure_tree, not for every folder
+        # Skip token refresh - will happen automatically on auth error if needed
+        # This makes folder creation much faster
         DBX.files_create_folder_v2(path, autorename=False)
     except (ApiError, RateLimitError) as e:
         # Extract RateLimitError if nested
@@ -402,6 +403,13 @@ def ensure_folder(path: str) -> None:
             raise rate_limit_err
         # Swallow 'already exists' or race conditions for other errors
         pass
+    except AuthError:
+        # Token expired - refresh and retry once
+        refresh_dbx_if_needed()
+        try:
+            DBX.files_create_folder_v2(path, autorename=False)
+        except ApiError:
+            pass  # Already exists or other error
 
 
 def ensure_tree(full_path: str) -> None:
@@ -456,23 +464,10 @@ def ensure_customer_order_folder(order_node: Dict[str, Any]) -> Tuple[str, str]:
         existing_link = None
 
     if existing_link:
-        # Customer has a metafield link - verify the folder actually exists in Dropbox
+        # Customer has a metafield link - use DROPBOX_ROOT directly (skip slow existence check)
+        # If folder doesn't exist, ensure_tree will create it safely
         root_path = f"{DROPBOX_ROOT}/{email}"
-        try:
-            refresh_dbx_if_needed()
-            DBX.files_get_metadata(root_path)
-            print(f"ℹ️  Customer has existing Dropbox folder: {root_path}")
-        except ApiError:
-            # Folder doesn't exist in Dropbox even though metafield has a link
-            # Create it and update the metafield
-            print(f"⚠️  Metafield link exists but folder not found in Dropbox, creating: {root_path}")
-            ensure_tree(root_path)
-            link = make_shared_link(root_path)
-            if link and customer_gid:
-                if set_customer_dropbox_link(customer_gid, link):
-                    print(f"💾 Updated Shopify metafield with new link for {email}")
-                else:
-                    print("⚠️  Metafield update failed; please verify in Shopify.")
+        ensure_tree(root_path)  # Safe - won't overwrite if exists
 
     # Fallback: default to standard DROPBOX_ROOT/email
     if not root_path:
@@ -507,23 +502,58 @@ def _is_ready(path: Path) -> bool:
     try:
         files = list(path.glob("**/*"))
         if not files:
+            msg = f"  ⚠️  {path.name} has no files yet"
+            print(msg)
+            if gui_callbacks['status']:
+                gui_callbacks['status'](msg)
             return False
         
         # Check if files are still being written
-        mtime = max(f.stat().st_mtime for f in files if f.is_file())
-        return (time.time() - mtime) > SETTLE_SECONDS
+        file_files = [f for f in files if f.is_file()]
+        if not file_files:
+            msg = f"  ⚠️  {path.name} has no actual files (only directories)"
+            print(msg)
+            if gui_callbacks['status']:
+                gui_callbacks['status'](msg)
+            return False
+        
+        mtime = max(f.stat().st_mtime for f in file_files)
+        time_since_mod = time.time() - mtime
+        if time_since_mod <= SETTLE_SECONDS:
+            msg = f"  ⏳ {path.name} files still settling ({time_since_mod:.1f}s < {SETTLE_SECONDS}s)"
+            print(msg)
+            if gui_callbacks['status']:
+                gui_callbacks['status'](msg)
+            return False
+        
+        msg = f"  ✅ {path.name} is ready ({len(file_files)} files, {time_since_mod:.1f}s since last write)"
+        print(msg)
+        if gui_callbacks['status']:
+            gui_callbacks['status'](msg)
+        return True
     except Exception as e:
-        print(f"Error checking {path}: {e}")
+        print(f"  ❌ Error checking {path.name}: {e}")
         return False
 
-@retry(wait=wait_exponential(multiplier=2, min=2, max=60), stop=stop_after_attempt(5), retry=retry_if_exception_type((RateLimitError, ApiError)))
+@retry(wait=wait_exponential(multiplier=2, min=2, max=60), stop=stop_after_attempt(5), retry=retry_if_exception_type((RateLimitError, ApiError, AuthError)))
 def _upload_single_file(file_path: Path, dropbox_file: str) -> bool:
     """Upload a single file with retry logic for rate limits."""
     try:
-        refresh_dbx_if_needed()
+        # Skip token refresh - will happen automatically on auth error if needed
+        # This makes uploads much faster
         with open(file_path, "rb") as f:
             DBX.files_upload(f.read(), dropbox_file, mode=WriteMode.overwrite)
         return True
+    except AuthError as e:
+        # Token expired - refresh and retry
+        error_str = str(e).lower()
+        if 'expired' in error_str or 'expired_access_token' in error_str:
+            refresh_dbx_if_needed()
+            # Retry once after refresh
+            with open(file_path, "rb") as f:
+                DBX.files_upload(f.read(), dropbox_file, mode=WriteMode.overwrite)
+            return True
+        raise
     except (ApiError, RateLimitError) as e:
         # Extract RateLimitError if nested
         rate_limit_err = _extract_rate_limit_error(e)
@@ -540,12 +570,20 @@ def upload_folder(local_dir: Path, dropbox_path: str, progress_callback=None) ->
     count = 0
     total_files = 0
     try:
+        # Refresh token once at the start for efficiency
+        refresh_dbx_if_needed()
         # Ensure target directory exists
         try:
-            refresh_dbx_if_needed()
             DBX.files_create_folder_v2(dropbox_path)
         except ApiError:
             pass
+        except AuthError:
+            # Token expired - refresh and retry
+            refresh_dbx_if_needed()
+            try:
+                DBX.files_create_folder_v2(dropbox_path)
+            except ApiError:
+                pass
 
         # Collect all files to upload
         files_to_upload = []
@@ -573,9 +611,9 @@ def upload_folder(local_dir: Path, dropbox_path: str, progress_callback=None) ->
                     progress_callback(idx, total_files, f"Uploading {file_path.name}...")
                 if _upload_single_file(file_path, dropbox_file):
                     count += 1
-            except (RateLimitError, ApiError) as e:
+            except (RateLimitError, ApiError, AuthError) as e:
                 # If retries are exhausted, log and continue to next file
-                error_msg = f"⚠️  Rate limit error uploading {file_path} after retries: {e}"
+                error_msg = f"⚠️  Error uploading {file_path.name} after retries: {e}"
                 print(error_msg)
                 log_dropbox_error("Upload File (After Retries)", e, f"File: {file_path}, Dropbox path: {dropbox_file}")
                 if progress_callback:
@@ -674,35 +712,57 @@ def set_order_gui(order_num_raw: str, tags: Optional[List[str]] = None) -> bool:
     order = results[0]
     tags_confirmed: List[str] = parsed_tags
     
-    try:
-        root_path, order_path = ensure_customer_order_folder(order)
-    except Exception as exc:
-        error_msg = f"⚠️  Error preparing Dropbox folders: {exc}"
-        print(error_msg)
-        if gui_callbacks['error']:
-            gui_callbacks['error']("Order Setup", f"Dropbox folder creation failed: {exc}\nUsing /pending folder instead.")
-        root_path, order_path = f"{DROPBOX_ROOT}/pending", f"{DROPBOX_ROOT}/pending"
-    
     # Strip # from order name if present
     order_no = order["name"]
     if order_no.startswith("#"):
         order_no = order_no[1:]
     
+    # Update GUI immediately with order info (before slow Dropbox operations)
     with order_lock:
         current_order_data = {
             "order_gid": order["id"],
             "order_no": order_no,
             "email": order.get("email", "unknown"),
             "order_node": order,
-            "dropbox_root_path": root_path,
-            "dropbox_order_path": order_path
+            "dropbox_root_path": None,  # Will be set after Dropbox operations
+            "dropbox_order_path": None  # Will be set after Dropbox operations
         }
         if tags_confirmed:
             current_order_data["pending_tags"] = tags_confirmed
     
-    # Notify GUI of order change
+    # Notify GUI immediately (shows order number right away)
     if gui_callbacks['order_changed']:
         gui_callbacks['order_changed'](current_order_data)
+    
+    # Do Dropbox operations in background thread (don't block)
+    def setup_dropbox_folders():
+        try:
+            root_path, order_path = ensure_customer_order_folder(order)
+            # Update with actual paths
+            with order_lock:
+                if current_order_data:
+                    current_order_data["dropbox_root_path"] = root_path
+                    current_order_data["dropbox_order_path"] = order_path
+            # Notify GUI again with complete info
+            if gui_callbacks['order_changed']:
+                gui_callbacks['order_changed'](current_order_data)
+        except Exception as exc:
+            error_msg = f"⚠️  Error preparing Dropbox folders: {exc}"
+            print(error_msg)
+            if gui_callbacks['error']:
+                gui_callbacks['error']("Order Setup", f"Dropbox folder creation failed: {exc}\nUsing /pending folder instead.")
+            root_path, order_path = f"{DROPBOX_ROOT}/pending", f"{DROPBOX_ROOT}/pending"
+            # Update with fallback paths
+            with order_lock:
+                if current_order_data:
+                    current_order_data["dropbox_root_path"] = root_path
+                    current_order_data["dropbox_order_path"] = order_path
+            if gui_callbacks['order_changed']:
+                gui_callbacks['order_changed'](current_order_data)
+    
+    # Run Dropbox setup in background thread
+    dropbox_thread = threading.Thread(target=setup_dropbox_folders, daemon=True)
+    dropbox_thread.start()
     
     return True
 
@@ -859,6 +919,7 @@ def process_scan(scan_dir: Path) -> None:
             dest = f"{order_path}/{scan_name}"
             print(f"\n📤 Uploading {scan_name} to order #{order['order_no']}...")
         
+        # Notify GUI that upload is starting
         if gui_callbacks['upload_started']:
             gui_callbacks['upload_started'](scan_name, dest)
         
@@ -872,8 +933,11 @@ def process_scan(scan_dir: Path) -> None:
         uploaded = upload_folder(scan_dir, dest, progress_cb)
         print(f"✅ Uploaded {uploaded} files")
         
+        # Notify GUI that upload is complete
         if gui_callbacks['upload_completed']:
             gui_callbacks['upload_completed'](scan_name, uploaded, dest)
+        else:
+            print(f"[DEBUG] upload_completed callback is None!")
         
         # Mark as processed
         STATE[scan_name] = True

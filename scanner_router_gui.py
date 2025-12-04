@@ -51,6 +51,11 @@ class ScannerWorker(QThread):
     status_update = Signal(str)
     error_occurred = Signal(str, str)
     path_changed = Signal(str)  # Emit when path changes
+    # Signals for router callbacks
+    upload_started_signal = Signal(str, str)  # scan_name, dest
+    upload_progress_signal = Signal(str, int, int, str)  # scan_name, current, total, message
+    upload_completed_signal = Signal(str, int, str)  # scan_name, file_count, dest
+    scan_detected_signal = Signal(str, dict)  # scan_name, order
     
     def __init__(self):
         super().__init__()
@@ -101,40 +106,25 @@ class ScannerWorker(QThread):
                     if scan_dir.name in self.existing_folders:
                         continue
                     
-                    # Found a new folder - process it
-                    # process_scan will handle STATE checks and readiness checks
-                    try:
-                        # Log that we found a new folder
-                        self.status_update.emit(f"🔍 Found new folder: {scan_dir.name}")
-                        
-                        # Check if already in STATE (already processed)
-                        if router.STATE.get(scan_dir.name):
-                            # Already processed, mark as seen
-                            self.existing_folders.add(scan_dir.name)
-                            continue
-                        
-                        # Process scan (it will check readiness internally)
-                        router.process_scan(scan_dir)
-                        
-                        # After processing, check if it's now in STATE (successfully processed)
-                        # If so, mark as seen. If not, it wasn't ready and we'll check again next time.
-                        if router.STATE.get(scan_dir.name):
-                            self.existing_folders.add(scan_dir.name)
-                    except Exception as scan_error:
-                        # Log full traceback for scan processing errors
-                        error_trace = traceback.format_exc()
-                        log_error_to_file(f"Processing Scan: {scan_dir.name}", error_trace)
-                        # Emit error signal
-                        self.error_occurred.emit(f"Processing Scan: {scan_dir.name}", f"{str(scan_error)}\n\nFull traceback logged to error log file.")
-                        # Mark as seen even on error to avoid infinite retry loops
+                    # Check if already processed in router STATE
+                    if router.STATE.get(scan_dir.name):
+                        # Already processed, add to existing_folders to skip in future
+                        self.existing_folders.add(scan_dir.name)
+                        continue
+                    
+                    # New folder detected - notify GUI
+                    self.status_update.emit(f"🔍 Found new folder: {scan_dir.name} - checking files and settling...")
+                    
+                    # Process scan (this will trigger callbacks)
+                    router.process_scan(scan_dir)
+                    
+                    # After processing, check if it was successfully added to STATE
+                    # If so, add to existing_folders to prevent re-checking
+                    if router.STATE.get(scan_dir.name):
                         self.existing_folders.add(scan_dir.name)
                     
             except Exception as e:
-                # Log full traceback to file
-                error_trace = traceback.format_exc()
-                log_error_to_file("Scanner Loop", error_trace)
-                # Emit error signal with full traceback
-                self.error_occurred.emit("Scanner Loop", f"{str(e)}\n\nFull traceback logged to error log file.")
+                self.error_occurred.emit("Scanner Loop", str(e))
                 time.sleep(1)
     
     def stop(self):
@@ -145,6 +135,7 @@ class OrderWorker(QObject):
     order_found = Signal(dict)  # Emits order info for confirmation
     order_not_found = Signal(str)  # Emits order input that wasn't found
     order_set_result = Signal(bool, str)  # Emits (success, order_input)
+    order_paths_ready = Signal(str, str)  # Emits (root_path, order_path) when Dropbox paths are ready
     
     def search_and_confirm(self, order_input: str):
         """Search for order in background thread"""
@@ -167,9 +158,19 @@ class OrderWorker(QObject):
         self.order_found.emit(order_info)
     
     def set_order(self, order_input: str):
-        """Set the order in background thread"""
+        """Set the order in background thread - returns immediately, does Dropbox ops async"""
+        # This will update GUI immediately, then do Dropbox ops
         success = router.set_order_gui(order_input)
         self.order_set_result.emit(success, order_input)
+        
+        # If successful, get the paths (they might be None initially, will be set async)
+        with router.order_lock:
+            order_data = router.current_order_data
+            if order_data and isinstance(order_data, dict):
+                root_path = order_data.get("dropbox_root_path")
+                order_path = order_data.get("dropbox_order_path")
+                if root_path and order_path:
+                    self.order_paths_ready.emit(root_path, order_path)
 
 class ScannerRouterGUI(QMainWindow):
     def __init__(self):
@@ -282,9 +283,6 @@ class ScannerRouterGUI(QMainWindow):
             }
         """)
         
-        # Setup GUI callbacks
-        self.setup_callbacks()
-        
         # Create UI first (so all widgets exist)
         self.init_ui()
         
@@ -299,6 +297,7 @@ class ScannerRouterGUI(QMainWindow):
         self.order_worker.order_found.connect(self.on_order_found)
         self.order_worker.order_not_found.connect(self.on_order_not_found)
         self.order_worker.order_set_result.connect(self.on_order_set_result)
+        self.order_worker.order_paths_ready.connect(self.on_order_paths_ready)
         self.order_worker_thread.start()
         
         # Start scanner worker thread
@@ -306,7 +305,15 @@ class ScannerRouterGUI(QMainWindow):
         self.worker.status_update.connect(self.update_status)
         self.worker.error_occurred.connect(self.show_error)
         self.worker.path_changed.connect(self.on_scan_path_changed)
+        # Connect worker signals for upload callbacks (thread-safe)
+        self.worker.upload_started_signal.connect(self.on_upload_started)
+        self.worker.upload_progress_signal.connect(self.on_upload_progress)
+        self.worker.upload_completed_signal.connect(self.on_upload_completed)
+        self.worker.scan_detected_signal.connect(self.on_scan_detected)
         self.worker.start()
+        
+        # Setup GUI callbacks (after worker is created)
+        self.setup_callbacks()
         
         # Update timer for refreshing order info
         self.update_timer = QTimer()
@@ -485,42 +492,31 @@ class ScannerRouterGUI(QMainWindow):
                          "Automatically routes scanner output to customer Dropbox folders.")
     
     def setup_callbacks(self):
-        """Setup callbacks for the router module - all wrapped for thread safety"""
+        """Setup callbacks for the router module - use signals for thread safety"""
+        # Use worker signals for upload-related callbacks (thread-safe)
+        router.gui_callbacks['scan_detected'] = lambda name, order: self.worker.scan_detected_signal.emit(name, order)
+        router.gui_callbacks['upload_started'] = lambda name, dest: self.worker.upload_started_signal.emit(name, dest)
+        router.gui_callbacks['upload_progress'] = lambda name, curr, total, msg: self.worker.upload_progress_signal.emit(name, curr, total, msg)
+        router.gui_callbacks['upload_completed'] = lambda name, count, dest: self.worker.upload_completed_signal.emit(name, count, dest)
+        
+        # For other callbacks, use QTimer for thread safety
         def safe_callback(callback_func):
-            """Wrap callback to ensure it runs on main thread and catches exceptions"""
+            """Wrap callback to ensure it runs on main thread"""
             def wrapper(*args, **kwargs):
-                try:
-                    # Capture args/kwargs in closure
-                    captured_args = args
-                    captured_kwargs = kwargs
-                    callback_name = callback_func.__name__
-                    
-                    def safe_execute():
-                        """Execute callback with exception handling"""
+                def safe_execute():
+                    try:
+                        callback_func(*args, **kwargs)
+                    except Exception as e:
+                        error_trace = traceback.format_exc()
+                        log_error_to_file(f"Callback Execution: {callback_func.__name__}", error_trace)
                         try:
-                            callback_func(*captured_args, **captured_kwargs)
-                        except Exception as e:
-                            error_trace = traceback.format_exc()
-                            log_error_to_file(f"Callback Execution: {callback_name}", error_trace)
-                            # Try to show error in GUI
-                            try:
-                                self.log_message(f"Error in callback {callback_name}: {str(e)}", "ERROR")
-                            except:
-                                pass  # If we can't even log, just continue
-                    
-                    # Use QTimer to ensure execution on main thread
-                    QTimer.singleShot(0, safe_execute)
-                except Exception as e:
-                    error_trace = traceback.format_exc()
-                    log_error_to_file(f"Callback Wrapper: {callback_func.__name__}", error_trace)
-            
+                            self.log_message(f"Error in callback {callback_func.__name__}: {str(e)}", "ERROR")
+                        except:
+                            pass
+                QTimer.singleShot(0, safe_execute)
             return wrapper
         
         router.gui_callbacks['order_changed'] = safe_callback(self.on_order_changed)
-        router.gui_callbacks['scan_detected'] = safe_callback(self.on_scan_detected)
-        router.gui_callbacks['upload_started'] = safe_callback(self.on_upload_started)
-        router.gui_callbacks['upload_progress'] = safe_callback(self.on_upload_progress)
-        router.gui_callbacks['upload_completed'] = safe_callback(self.on_upload_completed)
         router.gui_callbacks['error'] = safe_callback(self.on_error)
         router.gui_callbacks['status'] = safe_callback(self.on_status)
     
@@ -1100,7 +1096,8 @@ class ScannerRouterGUI(QMainWindow):
             if order_no.startswith("#"):
                 order_no = order_no[1:]
             dropbox_path = order_data.get("dropbox_order_path", "")
-            if "/pending" in dropbox_path:
+            # Only show warning if paths are set (not None) and contain /pending
+            if dropbox_path and "/pending" in dropbox_path:
                 QMessageBox.warning(
                     self,
                     "Using Pending Folder",
@@ -1108,7 +1105,17 @@ class ScannerRouterGUI(QMainWindow):
                     "This usually means there was an error creating the customer's Dropbox folder.\n"
                     "Check the logs for details."
                 )
-            self.log_message(f"Order changed: #{order_no}", "SUCCESS")
+            # Only log if order_no is not None/empty
+            if order_no and order_no != "Unknown":
+                self.log_message(f"Order changed: #{order_no}", "SUCCESS")
+    
+    def on_order_paths_ready(self, root_path: str, order_path: str):
+        """Callback when Dropbox paths are ready (async update)"""
+        with router.order_lock:
+            if router.current_order_data:
+                router.current_order_data["dropbox_root_path"] = root_path
+                router.current_order_data["dropbox_order_path"] = order_path
+        self.refresh_order_info()  # Update GUI with paths
     
     def on_scan_detected(self, scan_name: str, order: Dict[str, Any]):
         """Callback when a scan is detected"""
@@ -1123,7 +1130,10 @@ class ScannerRouterGUI(QMainWindow):
     def on_upload_started(self, scan_name: str, dest: str):
         """Callback when upload starts"""
         try:
-            self.log_message(f"📤 Starting upload: {scan_name} → {dest}", "INFO")
+            # Show prominent message in log
+            self.log_message(f"📤 Starting upload: {scan_name}", "SUCCESS")
+            self.log_message(f"   Destination: {dest}", "INFO")
+            # Update progress UI
             self.current_upload_label.setText(f"Uploading: {scan_name}")
             self.progress_bar.setValue(0)
             self.progress_status_label.setText("Initializing...")
@@ -1150,17 +1160,21 @@ class ScannerRouterGUI(QMainWindow):
     def on_upload_completed(self, scan_name: str, file_count: int, dest: str):
         """Callback when upload completes"""
         try:
+            # Show prominent success message
             self.log_message(f"✅ Upload completed: {scan_name} ({file_count} files)", "SUCCESS")
+            self.log_message(f"   Saved to: {dest}", "INFO")
+            # Update progress UI
             self.current_upload_label.setText("No active upload")
             self.progress_bar.setValue(100)
             self.progress_status_label.setText(f"Completed: {file_count} files uploaded")
+            # Update scan table
+            self.update_scan_status(scan_name, "Completed", file_count)
+            # Reset progress bar after a delay
+            QTimer.singleShot(3000, lambda: self.progress_bar.setValue(0))
         except Exception as e:
             error_trace = traceback.format_exc()
             log_error_to_file("on_upload_completed", error_trace)
             self.log_message(f"Error in upload completion: {str(e)}", "ERROR")
-        self.update_scan_status(scan_name, "Completed", file_count)
-        # Reset progress bar after a delay
-        QTimer.singleShot(3000, lambda: self.progress_bar.setValue(0))
     
     def on_error(self, scan_name: str, error_msg: str):
         """Callback for errors"""
@@ -1257,6 +1271,8 @@ def qt_exception_handler(msg_type, context, message):
     print(f"Qt Exception: {message}", file=sys.stderr)
 
 def main():
+    import signal
+    
     # Set up global exception handler
     sys.excepthook = exception_handler
     
@@ -1265,6 +1281,15 @@ def main():
     # Set up Qt exception handler
     from PySide6.QtCore import qInstallMessageHandler, QtMsgType
     qInstallMessageHandler(qt_exception_handler)
+    
+    # Handle Ctrl+C (SIGINT) gracefully
+    def signal_handler(sig, frame):
+        print("\n\n⚠️  Interrupted by user (Ctrl+C)")
+        print("Shutting down gracefully...")
+        app.quit()
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
     
     # Log startup (info, not error)
     try:
@@ -1288,6 +1313,10 @@ def main():
     
     try:
         sys.exit(app.exec())
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Interrupted by user (Ctrl+C)")
+        app.quit()
+        sys.exit(0)
     except Exception as e:
         error_trace = traceback.format_exc()
         log_error_to_file("Application Exit", error_trace)
