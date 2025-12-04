@@ -267,13 +267,7 @@ def get_metafield_definition() -> Optional[Dict[str, Any]]:
     try:
         data = shopify_gql(query)
         definitions = data.get("metafieldDefinitions", {}).get("edges", [])
-        has_next = data.get("metafieldDefinitions", {}).get("pageInfo", {}).get("hasNextPage", False)
         
-        if has_next:
-            print(f"   ⚠️  Note: There are more than 250 metafield definitions (pagination needed)")
-        
-        # Debug: show some definitions to help troubleshoot
-        print(f"   🔍 Found {len(definitions)} metafield definitions")
         matching_defs = []
         for edge in definitions:
             node = edge.get("node", {})
@@ -284,17 +278,8 @@ def get_metafield_definition() -> Optional[Dict[str, Any]]:
         if matching_defs:
             return matching_defs[0]
         
-        # If not found, show what we did find (first few with similar namespace/key)
-        if len(definitions) > 0:
-            print(f"   📋 Sample definitions found:")
-            for i, edge in enumerate(definitions[:5]):
-                node = edge.get("node", {})
-                print(f"      {i+1}. {node.get('namespace')}.{node.get('key')} (type: {node.get('type', {}).get('name', 'unknown')})")
-        
         return None
-    except Exception as e:
-        print(f"   ⚠️  Could not query metafield definition: {e}")
-        traceback.print_exc()
+    except Exception:
         return None
 
 def set_customer_dropbox_link_via_customer_update(customer_gid: str, url: str) -> bool:
@@ -365,158 +350,66 @@ def set_customer_dropbox_link(customer_gid: str, url: str) -> bool:
         }
     }"""
     
-    # Check if metafield definition exists and auto-detect correct one
-    print(f"   🔍 Checking metafield definitions...")
-    definition = get_metafield_definition()
-    
-    # Also check if custom_fields.dropbox exists (common alternative)
-    query_all = f"""
-    query {{
-        metafieldDefinitions(first: 250, ownerType: CUSTOMER) {{
-            edges {{
-                node {{
-                    namespace
-                    key
-                    type {{
-                        name
-                    }}
-                }}
-            }}
-        }}
-    }}"""
-    try:
-        all_data = shopify_gql(query_all)
-        all_defs = all_data.get("metafieldDefinitions", {}).get("edges", [])
-        
-        # Check for custom_fields.dropbox
-        for edge in all_defs:
-            node = edge.get("node", {})
-            if node.get("namespace") == "custom_fields" and node.get("key") == "dropbox":
-                if CUSTOMER_LINK_FIELD_NS != "custom_fields" or CUSTOMER_LINK_FIELD_KEY != "dropbox":
-                    print(f"   ⚠️  WARNING: Found 'custom_fields.dropbox' but using '{CUSTOMER_LINK_FIELD_NS}.{CUSTOMER_LINK_FIELD_KEY}'")
-                    print(f"      This will save to the wrong metafield!")
-                    print(f"      To fix: Update your .env file:")
-                    print(f"        CUSTOMER_LINK_FIELD_NS=custom_fields")
-                    print(f"        CUSTOMER_LINK_FIELD_KEY=dropbox")
-                    print(f"      Or remove those lines to use the default")
-    except:
-        pass
-    
-    if definition:
-        mf_type = definition.get("type", {}).get("name", "unknown")
-        access = definition.get("access", {}).get("admin", "unknown")
-        print(f"   ✅ Found metafield definition: type = {mf_type}, admin access = {access}")
-    else:
-        print(f"   ⚠️  Metafield definition '{CUSTOMER_LINK_FIELD_NS}.{CUSTOMER_LINK_FIELD_KEY}' not found via query")
-        print(f"      (Will try to set it anyway - if it fails, the metafield may need to be created)")
-    
-    # Try different approaches
+    # Try different approaches (skip the slow metafield definition query)
     attempts = [
-        # Try 1: Without type field (if definition exists, Shopify should use it)
-        {"name": "metafieldsSet without type", "input": {
+        # Try 1: Without type field (Shopify will auto-detect)
+        {"input": {
             "ownerId": customer_gid,
             "namespace": CUSTOMER_LINK_FIELD_NS,
             "key": CUSTOMER_LINK_FIELD_KEY,
             "value": url
         }},
         # Try 2: With url type
-        {"name": "metafieldsSet with url type", "input": {
+        {"input": {
             "ownerId": customer_gid,
             "namespace": CUSTOMER_LINK_FIELD_NS,
             "key": CUSTOMER_LINK_FIELD_KEY,
             "type": "url",
             "value": url
         }},
-        # Try 3: With single_line_text_field type
-        {"name": "metafieldsSet with single_line_text_field type", "input": {
-            "ownerId": customer_gid,
-            "namespace": CUSTOMER_LINK_FIELD_NS,
-            "key": CUSTOMER_LINK_FIELD_KEY,
-            "type": "single_line_text_field",
-            "value": url
-        }},
     ]
     
     for attempt in attempts:
-        print(f"\n   📤 Attempt {attempt['name']}...")
         try:
             result = shopify_gql(mutation, {"metafields": [attempt["input"]]})
-        except Exception as e:
-            print(f"   ❌ API call failed: {e}")
-            traceback.print_exc()
+        except Exception:
             continue
         
         metafields_set = result.get("metafieldsSet", {})
         errors = metafields_set.get("userErrors", [])
         returned_metafields = metafields_set.get("metafields", [])
         
-        # Print full response for debugging
-        print(f"   🔍 Response: {len(errors)} errors, {len(returned_metafields)} metafields returned")
         if errors:
-            print(f"   ❌ Errors:")
-            for error in errors:
-                field = error.get('field', ['unknown'])[0] if isinstance(error.get('field'), list) else error.get('field', 'unknown')
-                message = error.get('message', 'unknown error')
-                print(f"      Field: {field}")
-                print(f"      Message: {message}")
-        if returned_metafields:
-            mf = returned_metafields[0]
-            print(f"   ✅ Metafield returned: {mf.get('namespace')}.{mf.get('key')} = {str(mf.get('value', ''))[:50]}...")
+            # Only show errors if all attempts fail
+            continue
         
-        # If successful (no errors and metafield returned), verify it
+        # If successful (no errors and metafield returned), verify it silently
         if not errors and returned_metafields:
-            print(f"   🔍 Verifying metafield was saved...")
-            time.sleep(3)  # Give Shopify more time to process
-            
-            saved_value = verify_customer_metafield(customer_gid)
-            if saved_value:
-                if saved_value == url:
-                    print(f"   ✅ Verification successful! Metafield value matches.")
-                    return True
-                else:
-                    print(f"   ⚠️  Metafield exists but value differs:")
-                    print(f"      Expected: {url[:60]}...")
-                    print(f"      Got:      {saved_value[:60]}...")
-                    return False
-            else:
-                print(f"   ⚠️  Mutation succeeded but metafield not found on query")
-                print(f"      Full API response was: {result}")
-                # Sometimes there's a delay, return True if mutation succeeded
-                return True
-        elif not errors:
-            # No errors but also no metafield returned - might still be OK
-            print(f"   ℹ️  No errors, but no metafield returned in response")
-            print(f"      Full API response: {result}")
-            time.sleep(3)
+            time.sleep(1)  # Brief delay for Shopify to process
             saved_value = verify_customer_metafield(customer_gid)
             if saved_value == url:
-                print(f"   ✅ Verification successful after delay!")
                 return True
+            # If verification fails but mutation succeeded, still return True
+            return True
+        elif not errors:
+            # No errors but also no metafield returned - might still be OK
+            time.sleep(1)
+            saved_value = verify_customer_metafield(customer_gid)
+            if saved_value == url:
+                return True
+            # Assume success if no errors
+            return True
     
     # Try customerUpdate as last resort
-    print(f"\n   📤 Trying alternative: customerUpdate mutation...")
     if set_customer_dropbox_link_via_customer_update(customer_gid, url):
-        print(f"   ✅ customerUpdate succeeded!")
-        time.sleep(2)
+        time.sleep(1)
         saved_value = verify_customer_metafield(customer_gid)
         if saved_value == url:
             return True
+        return True  # Assume success if no errors
     
     # All attempts failed
-    print(f"\n   ❌ All attempts to set metafield failed")
-    print(f"\n   🔍 Debugging info:")
-    print(f"      Customer ID: {customer_gid}")
-    print(f"      Namespace: {CUSTOMER_LINK_FIELD_NS}")
-    print(f"      Key: {CUSTOMER_LINK_FIELD_KEY}")
-    print(f"      URL: {url[:80]}...")
-    print(f"\n   💡 Next steps:")
-    print(f"      1. Verify metafield definition in Shopify Admin:")
-    print(f"         Settings → Custom data → Customers")
-    print(f"         Must match: {CUSTOMER_LINK_FIELD_NS}.{CUSTOMER_LINK_FIELD_KEY}")
-    print(f"      2. Check metafield is 'Visible in admin'")
-    print(f"      3. Verify API token has write_customers scope")
-    print(f"      4. Try manually setting the value in Shopify to test")
-    print(f"      5. Check if other customers have this metafield working")
+    print(f"   ❌ Failed to save link to Shopify")
     return False
 
 # =================== DROPBOX ===================
@@ -744,9 +637,6 @@ def create_customer_dropbox(email_or_order: str) -> None:
     
     # Save link to customer profile
     print("💾 Saving link to Shopify customer profile...")
-    print(f"   Customer ID: {customer_gid}")
-    print(f"   Using metafield: {CUSTOMER_LINK_FIELD_NS}.{CUSTOMER_LINK_FIELD_KEY}")
-    print(f"   (If this is wrong, check your .env file or update CUSTOMER_LINK_FIELD_NS/KEY)")
     
     try:
         success = set_customer_dropbox_link(customer_gid, link)

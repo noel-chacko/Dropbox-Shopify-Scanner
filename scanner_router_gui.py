@@ -28,20 +28,23 @@ import scanner_router_direct as router
 # Error log file
 ERROR_LOG_FILE = Path(__file__).parent / "scanner_router_errors.log"
 
-def log_error_to_file(source: str, error_msg: str):
-    """Log error to file with timestamp"""
+def log_error_to_file(source: str, error_msg: str, is_error: bool = True):
+    """Log error or info message to file with timestamp"""
     try:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(ERROR_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(f"\n{'='*80}\n")
-            f.write(f"[{timestamp}] Error in {source}\n")
+            if is_error:
+                f.write(f"[{timestamp}] Error in {source}\n")
+            else:
+                f.write(f"[{timestamp}] {source}\n")
             f.write(f"{'='*80}\n")
             f.write(f"{error_msg}\n")
             f.write(f"{'='*80}\n\n")
     except Exception as e:
         # If we can't write to log file, at least print it
         print(f"Failed to write to error log: {e}")
-        print(f"Original error: {error_msg}")
+        print(f"Original message: {error_msg}")
 
 class ScannerWorker(QThread):
     """Worker thread that runs the scanner loop"""
@@ -1263,9 +1266,9 @@ def main():
     from PySide6.QtCore import qInstallMessageHandler, QtMsgType
     qInstallMessageHandler(qt_exception_handler)
     
-    # Log startup
+    # Log startup (info, not error)
     try:
-        log_error_to_file("Application", "Application started")
+        log_error_to_file("Application", "Application started", is_error=False)
     except Exception as e:
         print(f"Failed to log startup: {e}", file=sys.stderr)
     

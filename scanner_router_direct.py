@@ -393,7 +393,7 @@ def _extract_rate_limit_error(e: Exception) -> Optional[RateLimitError]:
 def ensure_folder(path: str) -> None:
     """Create a folder with retry logic for rate limits."""
     try:
-        refresh_dbx_if_needed()
+        # Only refresh token once at the start of ensure_tree, not for every folder
         DBX.files_create_folder_v2(path, autorename=False)
     except (ApiError, RateLimitError) as e:
         # Extract RateLimitError if nested
@@ -405,8 +405,12 @@ def ensure_folder(path: str) -> None:
 
 
 def ensure_tree(full_path: str) -> None:
+    """Create folder tree - refresh token once at the start for efficiency"""
     if not full_path or full_path == "/":
         return
+
+    # Refresh token once at the start instead of before each folder creation
+    refresh_dbx_if_needed()
 
     parts = [p for p in PurePosixPath(full_path).parts if p != "/"]
     if not parts:
@@ -425,12 +429,12 @@ def ensure_tree(full_path: str) -> None:
 
 
 def make_shared_link(path: str) -> Optional[str]:
+    """Create or retrieve shared link - refresh token once"""
+    refresh_dbx_if_needed()  # Refresh once for both operations
     try:
-        refresh_dbx_if_needed()
         return DBX.sharing_create_shared_link_with_settings(path).url
     except ApiError:
         try:
-            refresh_dbx_if_needed()
             links = DBX.sharing_list_shared_links(path=path).links
             return links[0].url if links else None
         except ApiError as e:
@@ -452,69 +456,23 @@ def ensure_customer_order_folder(order_node: Dict[str, Any]) -> Tuple[str, str]:
         existing_link = None
 
     if existing_link:
+        # Customer has a metafield link - verify the folder actually exists in Dropbox
+        root_path = f"{DROPBOX_ROOT}/{email}"
         try:
             refresh_dbx_if_needed()
-            md = DBX.sharing_get_shared_link_metadata(existing_link)
-            path = getattr(md, "path_display", None) or getattr(md, "path_lower", None)
-            
-            # Handle case where path fields are NOT_SET (common with shared folder links)
-            if path is None or (hasattr(path, '__class__') and 'NOT_SET' in str(path)):
-                # Try to get the folder name from metadata
-                folder_name = getattr(md, "name", None)
-                if folder_name and folder_name == email:
-                    # We have the folder name but not the full path
-                    # Construct path using DROPBOX_ROOT (which should have the correct team folder path)
-                    path = f"{DROPBOX_ROOT}/{email}"
-                    print(f"ℹ️  Shared link path not available, using DROPBOX_ROOT: {path}")
+            DBX.files_get_metadata(root_path)
+            print(f"ℹ️  Customer has existing Dropbox folder: {root_path}")
+        except ApiError:
+            # Folder doesn't exist in Dropbox even though metafield has a link
+            # Create it and update the metafield
+            print(f"⚠️  Metafield link exists but folder not found in Dropbox, creating: {root_path}")
+            ensure_tree(root_path)
+            link = make_shared_link(root_path)
+            if link and customer_gid:
+                if set_customer_dropbox_link(customer_gid, link):
+                    print(f"💾 Updated Shopify metafield with new link for {email}")
                 else:
-                    path = None
-            
-            if path:
-                # Check if the path looks incorrect (e.g., just "/orders" lowercase instead of full team folder path)
-                # If DROPBOX_ROOT is set to a full team folder path, and the resolved path is just "/orders",
-                # use DROPBOX_ROOT instead
-                if path.lower().startswith("/orders") and DROPBOX_ROOT and DROPBOX_ROOT != "/Orders" and DROPBOX_ROOT != "/orders":
-                    # The resolved path is likely incomplete, use DROPBOX_ROOT instead
-                    root_path = f"{DROPBOX_ROOT}/{email}"
-                    print(f"⚠️  Resolved path '{path}' appears incomplete, using DROPBOX_ROOT: {root_path}")
-                else:
-                    # Use path exactly as Dropbox returns it (handles team folders automatically)
-                    # path_display gives us the correct case and full path including team folders
-                    # The path should be the FULL absolute path like: /work/PhotoLounge Rittenhouse/Orders/email@example.com
-                    root_path = path
-                    print(f"ℹ️  Using customer's existing Dropbox root: {root_path}")
-                
-                # Cache the base path for future use (extract everything before the email)
-                # The path should be like: /work/PhotoLounge Rittenhouse/Orders/email@example.com
-                # We want to extract: /work/PhotoLounge Rittenhouse/Orders
-                global _detected_team_base
-                if not _detected_team_base:
-                    import re
-                    # Match the email part at the end: /email@domain.com or /email@domain.com/
-                    # This should match the last component that looks like an email
-                    email_pattern = r'/[^/]+@[^/]+/?$'
-                    match = re.search(email_pattern, path)
-                    if match:
-                        base = path[:match.start()].rstrip('/')
-                        print(f"🔍 Debug: Extracted base '{base}' from path '{path}'")
-                        
-                        # Verify the base path looks reasonable (should contain "Orders" or similar)
-                        # Only cache if it's not just "/orders" (lowercase) - that's likely wrong
-                        if base and base != "/Orders" and base != "/orders" and len(base) > 1:
-                            _detected_team_base = base
-                            print(f"ℹ️  Cached base path from existing customer: {base}")
-                        else:
-                            print(f"⚠️  Extracted base path '{base}' seems incorrect, not caching")
-                            print(f"    Full path was: {path}")
-                    else:
-                        print(f"⚠️  Could not extract base path from: {path}")
-                        print(f"    Path doesn't match expected email pattern")
-            else:
-                print(f"⚠️  Shared link exists but no path was available; falling back to default root for {email}")
-                print(f"    Metadata object: {md}")
-        except Exception as e:
-            print(f"⚠️  Could not resolve customer's shared link metadata: {e}; falling back to default root for {email}")
-            log_dropbox_error("Resolve Shared Link Metadata", e, f"Customer email: {email}, Link: {existing_link[:50] if existing_link else 'None'}...")
+                    print("⚠️  Metafield update failed; please verify in Shopify.")
 
     # Fallback: default to standard DROPBOX_ROOT/email
     if not root_path:
@@ -536,38 +494,10 @@ def ensure_customer_order_folder(order_node: Dict[str, Any]) -> Tuple[str, str]:
         order_number = ''.join(ch for ch in (order_node.get("name") or "") if ch.isdigit()) or "order"
 
     order_path = f"{root_path}/{order_number}"
-    folder_exists = False
-    try:
-        refresh_dbx_if_needed()
-        metadata = DBX.files_get_metadata(order_path)
-        # Check if it's actually a folder
-        if hasattr(metadata, 'is_folder') and metadata.is_folder:
-            folder_exists = True
-            print(f"ℹ️  Order folder already exists: {order_path}")
-            if gui_callbacks['status']:
-                gui_callbacks['status'](f"Order folder already exists: {order_path}")
-        else:
-            # It exists but it's not a folder - this shouldn't happen, but don't overwrite
-            print(f"⚠️  Path exists but is not a folder: {order_path}")
-            folder_exists = True  # Treat as exists to avoid overwriting
-    except ApiError as e:
-        # Check if it's specifically a "not found" error
-        error_str = str(e).lower()
-        error_reason = getattr(e.error, 'get_path', lambda: None)() if hasattr(e, 'error') else None
-        
-        # Log all ApiErrors, but only create folder if it's a "not found" error
-        if 'not_found' not in error_str and 'path_not_found' not in error_str:
-            log_dropbox_error("Check Order Folder", e, f"Order path: {order_path}")
-        
-        # Only create if we're certain it's a "not found" error
-        if 'not_found' in error_str or 'path_not_found' in error_str or (hasattr(e.error, 'is_path_not_found') and e.error.is_path_not_found()):
-            # Folder doesn't exist - safe to create
-            ensure_tree(order_path)
-            print(f"📁 Created order folder: {order_path}")
-        else:
-            # Other API errors (network, rate limit, etc.) - assume folder exists to be safe
-            print(f"⚠️  Error checking order folder (assuming it exists): {e}")
-            folder_exists = True  # Assume exists to avoid overwriting
+    # Skip the existence check - just create the folder (ensure_tree handles "already exists" gracefully)
+    # This is much faster - one API call instead of two
+    ensure_tree(order_path)
+    print(f"📁 Order folder ready: {order_path}")
 
     return root_path, order_path
 
