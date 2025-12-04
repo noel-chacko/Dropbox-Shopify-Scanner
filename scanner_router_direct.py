@@ -15,11 +15,40 @@ import threading
 from typing import Dict, Any, List, Tuple, Optional
 import requests
 import re
+import traceback
 from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import dropbox
 from dropbox.files import WriteMode
 from dropbox.exceptions import ApiError, RateLimitError, AuthError
+
+# Error log file for Dropbox errors
+DROPBOX_ERROR_LOG_FILE = Path(__file__).parent / "dropbox_errors.log"
+
+def log_dropbox_error(operation: str, error: Exception, context: str = ""):
+    """Log Dropbox errors to file in real-time"""
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        error_type = type(error).__name__
+        error_msg = str(error)
+        trace = traceback.format_exc()
+        
+        with open(DROPBOX_ERROR_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*80}\n")
+            f.write(f"[{timestamp}] Dropbox Error: {operation}\n")
+            if context:
+                f.write(f"Context: {context}\n")
+            f.write(f"Error Type: {error_type}\n")
+            f.write(f"Error Message: {error_msg}\n")
+            f.write(f"{'='*80}\n")
+            f.write(f"Traceback:\n{trace}\n")
+            f.write(f"{'='*80}\n\n")
+            f.flush()  # Flush immediately for real-time logging
+    except Exception as e:
+        # If we can't write to log file, at least print it
+        print(f"Failed to write to Dropbox error log: {e}")
+        print(f"Original Dropbox error: {error}")
+
 from dropbox.common import PathRootError
 
 # Load environment variables
@@ -236,6 +265,9 @@ STATE = load_state()
 current_order_data = None
 order_lock = threading.Lock()
 
+# Global variable to cache the detected team folder base path
+_detected_team_base: Optional[str] = None
+
 # GUI callback support (optional)
 gui_callbacks = {
     'order_changed': None,
@@ -403,6 +435,7 @@ def make_shared_link(path: str) -> Optional[str]:
             return links[0].url if links else None
         except ApiError as e:
             print(f"⚠️  Could not retrieve shared link for {path}: {e}")
+            log_dropbox_error("Retrieve Shared Link", e, f"Path: {path}")
             return None
 
 
@@ -423,97 +456,70 @@ def ensure_customer_order_folder(order_node: Dict[str, Any]) -> Tuple[str, str]:
             refresh_dbx_if_needed()
             md = DBX.sharing_get_shared_link_metadata(existing_link)
             path = getattr(md, "path_display", None) or getattr(md, "path_lower", None)
+            
+            # Handle case where path fields are NOT_SET (common with shared folder links)
+            if path is None or (hasattr(path, '__class__') and 'NOT_SET' in str(path)):
+                # Try to get the folder name from metadata
+                folder_name = getattr(md, "name", None)
+                if folder_name and folder_name == email:
+                    # We have the folder name but not the full path
+                    # Construct path using DROPBOX_ROOT (which should have the correct team folder path)
+                    path = f"{DROPBOX_ROOT}/{email}"
+                    print(f"ℹ️  Shared link path not available, using DROPBOX_ROOT: {path}")
+                else:
+                    path = None
+            
             if path:
-                # Use path exactly as Dropbox returns it (handles team folders automatically)
-                # path_display gives us the correct case and full path including team folders
-                root_path = path
-                print(f"ℹ️  Using customer's existing Dropbox root: {root_path}")
+                # Check if the path looks incorrect (e.g., just "/orders" lowercase instead of full team folder path)
+                # If DROPBOX_ROOT is set to a full team folder path, and the resolved path is just "/orders",
+                # use DROPBOX_ROOT instead
+                if path.lower().startswith("/orders") and DROPBOX_ROOT and DROPBOX_ROOT != "/Orders" and DROPBOX_ROOT != "/orders":
+                    # The resolved path is likely incomplete, use DROPBOX_ROOT instead
+                    root_path = f"{DROPBOX_ROOT}/{email}"
+                    print(f"⚠️  Resolved path '{path}' appears incomplete, using DROPBOX_ROOT: {root_path}")
+                else:
+                    # Use path exactly as Dropbox returns it (handles team folders automatically)
+                    # path_display gives us the correct case and full path including team folders
+                    # The path should be the FULL absolute path like: /work/PhotoLounge Rittenhouse/Orders/email@example.com
+                    root_path = path
+                    print(f"ℹ️  Using customer's existing Dropbox root: {root_path}")
                 
                 # Cache the base path for future use (extract everything before the email)
+                # The path should be like: /work/PhotoLounge Rittenhouse/Orders/email@example.com
+                # We want to extract: /work/PhotoLounge Rittenhouse/Orders
                 global _detected_team_base
                 if not _detected_team_base:
                     import re
+                    # Match the email part at the end: /email@domain.com or /email@domain.com/
+                    # This should match the last component that looks like an email
                     email_pattern = r'/[^/]+@[^/]+/?$'
                     match = re.search(email_pattern, path)
                     if match:
-                        base = path[:match.start()]
-                        if base and base != "/Orders":
+                        base = path[:match.start()].rstrip('/')
+                        print(f"🔍 Debug: Extracted base '{base}' from path '{path}'")
+                        
+                        # Verify the base path looks reasonable (should contain "Orders" or similar)
+                        # Only cache if it's not just "/orders" (lowercase) - that's likely wrong
+                        if base and base != "/Orders" and base != "/orders" and len(base) > 1:
                             _detected_team_base = base
                             print(f"ℹ️  Cached base path from existing customer: {base}")
+                        else:
+                            print(f"⚠️  Extracted base path '{base}' seems incorrect, not caching")
+                            print(f"    Full path was: {path}")
+                    else:
+                        print(f"⚠️  Could not extract base path from: {path}")
+                        print(f"    Path doesn't match expected email pattern")
             else:
                 print(f"⚠️  Shared link exists but no path was available; falling back to default root for {email}")
+                print(f"    Metadata object: {md}")
         except Exception as e:
             print(f"⚠️  Could not resolve customer's shared link metadata: {e}; falling back to default root for {email}")
+            log_dropbox_error("Resolve Shared Link Metadata", e, f"Customer email: {email}, Link: {existing_link[:50] if existing_link else 'None'}...")
 
     # Fallback: default to standard DROPBOX_ROOT/email
     if not root_path:
-        global _detected_team_base
-        
-        # Use DROPBOX_ROOT from env, but if it's just "/Orders", try to detect the actual base path
-        # by looking at existing customer folders in Shopify
-        dropbox_base = DROPBOX_ROOT
-        
-        # If we have a cached detected team base, use it
-        if _detected_team_base:
-            dropbox_base = _detected_team_base
-        elif dropbox_base == "/Orders":
-            # Try to detect the actual base path by querying Shopify for any customer with a Dropbox link
-            # and extracting the base path from their existing link
-            try:
-                # Search for any customer with a dropbox metafield to get the base path
-                # Use the configured metafield namespace and key
-                query = f"""
-                {{
-                    customers(first: 10, query: "metafield:{CUSTOMER_LINK_FIELD_NS}.{CUSTOMER_LINK_FIELD_KEY}:*") {{
-                        edges {{
-                            node {{
-                                id
-                                email
-                                metafield(namespace: "{CUSTOMER_LINK_FIELD_NS}", key: "{CUSTOMER_LINK_FIELD_KEY}") {{
-                                    value
-                                }}
-                            }}
-                        }}
-                    }}
-                }}
-                """
-                result = shopify_gql(query)
-                customers = result.get("customers", {}).get("edges", [])
-                
-                for edge in customers:
-                    customer = edge.get("node", {})
-                    meta = customer.get("metafield")
-                    if meta and meta.get("value"):
-                        existing_link = meta.get("value")
-                        try:
-                            refresh_dbx_if_needed()
-                            md = DBX.sharing_get_shared_link_metadata(existing_link)
-                            path = getattr(md, "path_display", None) or getattr(md, "path_lower", None)
-                            if path:
-                                # Extract the base path (everything before the email)
-                                # e.g., "/work/PhotoLounge Rittenhouse/Orders/email@example.com" -> "/work/PhotoLounge Rittenhouse/Orders"
-                                # Find the last "/" before what looks like an email
-                                import re
-                                email_pattern = r'/[^/]+@[^/]+/?$'
-                                match = re.search(email_pattern, path)
-                                if match:
-                                    base = path[:match.start()]
-                                    if base and base != "/Orders":
-                                        _detected_team_base = base
-                                        dropbox_base = base
-                                        print(f"ℹ️  Detected Dropbox base path from existing customer: {dropbox_base}")
-                                        break
-                        except Exception:
-                            continue
-                
-                # If detection failed, cache the default to avoid repeated attempts
-                if not _detected_team_base:
-                    _detected_team_base = DROPBOX_ROOT
-                    print(f"⚠️  Could not detect base path, using default: {DROPBOX_ROOT}")
-            except Exception as e:
-                print(f"⚠️  Could not detect base path: {e}, using default {DROPBOX_ROOT}")
-        
-        root_path = f"{dropbox_base}/{email}"
+        # Use DROPBOX_ROOT directly from .env file (simple approach like old code)
+        root_path = f"{DROPBOX_ROOT}/{email}"
         ensure_tree(root_path)
 
         link = make_shared_link(root_path)
@@ -548,6 +554,10 @@ def ensure_customer_order_folder(order_node: Dict[str, Any]) -> Tuple[str, str]:
         # Check if it's specifically a "not found" error
         error_str = str(e).lower()
         error_reason = getattr(e.error, 'get_path', lambda: None)() if hasattr(e, 'error') else None
+        
+        # Log all ApiErrors, but only create folder if it's a "not found" error
+        if 'not_found' not in error_str and 'path_not_found' not in error_str:
+            log_dropbox_error("Check Order Folder", e, f"Order path: {order_path}")
         
         # Only create if we're certain it's a "not found" error
         if 'not_found' in error_str or 'path_not_found' in error_str or (hasattr(e.error, 'is_path_not_found') and e.error.is_path_not_found()):
@@ -588,7 +598,10 @@ def _upload_single_file(file_path: Path, dropbox_file: str) -> bool:
         # Extract RateLimitError if nested
         rate_limit_err = _extract_rate_limit_error(e)
         if rate_limit_err:
+            log_dropbox_error("Upload Single File", e, f"File: {file_path}, Dropbox path: {dropbox_file}")
             raise rate_limit_err
+        # Log ApiErrors before retry
+        log_dropbox_error("Upload Single File", e, f"File: {file_path}, Dropbox path: {dropbox_file}")
         # Re-raise other ApiErrors to trigger retry
         raise
 
@@ -634,11 +647,13 @@ def upload_folder(local_dir: Path, dropbox_path: str, progress_callback=None) ->
                 # If retries are exhausted, log and continue to next file
                 error_msg = f"⚠️  Rate limit error uploading {file_path} after retries: {e}"
                 print(error_msg)
+                log_dropbox_error("Upload File (After Retries)", e, f"File: {file_path}, Dropbox path: {dropbox_file}")
                 if progress_callback:
                     progress_callback(idx + 1, total_files, error_msg)
             except Exception as e:
                 error_msg = f"Error uploading {file_path}: {e}"
                 print(error_msg)
+                log_dropbox_error("Upload File (Exception)", e, f"File: {file_path}, Dropbox path: {dropbox_file}")
                 if progress_callback:
                     progress_callback(idx + 1, total_files, error_msg)
         
@@ -654,11 +669,13 @@ def upload_folder(local_dir: Path, dropbox_path: str, progress_callback=None) ->
             except (RateLimitError, ApiError) as e:
                 error_msg = f"⚠️  Rate limit error uploading WPPC.jpg after retries: {e}"
                 print(error_msg)
+                log_dropbox_error("Upload WPPC.jpg (After Retries)", e, f"Dropbox path: {wppc_dropbox_path}")
                 if progress_callback:
                     progress_callback(total_files, total_files, error_msg)
             except Exception as e:
                 error_msg = f"⚠️  Error uploading WPPC.jpg: {e}"
                 print(error_msg)
+                log_dropbox_error("Upload WPPC.jpg (Exception)", e, f"Dropbox path: {wppc_dropbox_path}")
                 if progress_callback:
                     progress_callback(total_files, total_files, error_msg)
         else:
@@ -936,6 +953,7 @@ def process_scan(scan_dir: Path) -> None:
         error_msg = f"❌ Rate limit error processing {scan_name}: {e}"
         print(error_msg)
         print("   Waiting 10 seconds before retrying...")
+        log_dropbox_error("Process Scan (Rate Limit)", e, f"Scan: {scan_name}, Destination: {dest}")
         if gui_callbacks['error']:
             gui_callbacks['error'](scan_name, error_msg)
         time.sleep(10)
@@ -943,6 +961,9 @@ def process_scan(scan_dir: Path) -> None:
     except Exception as e:
         error_msg = f"❌ Error processing {scan_name}: {e}"
         print(error_msg)
+        # Only log Dropbox-related errors to the Dropbox log
+        if isinstance(e, (ApiError, RateLimitError, AuthError)):
+            log_dropbox_error("Process Scan (Exception)", e, f"Scan: {scan_name}, Destination: {dest}")
         if gui_callbacks['error']:
             gui_callbacks['error'](scan_name, error_msg)
 
@@ -951,6 +972,7 @@ def main():
     print("📷 DIRECT SCANNER ROUTER")
     print("="*60)
     print(f"Watching: {NORITSU_ROOT}")
+    print(f"📄 Dropbox errors will be logged to: {DROPBOX_ERROR_LOG_FILE}")
     print("="*60)
 
     # Create initial snapshot of existing folders
