@@ -345,8 +345,57 @@ def set_customer_dropbox_link(customer_gid: str, url: str) -> bool:
     return True
 
 
+def order_update_note(order_gid: str, note: str, append: bool = True) -> bool:
+    """Update order note in Shopify. If append=True, appends to existing note."""
+    try:
+        # First, get current note if appending
+        if append:
+            query = """
+            query($id: ID!) {
+                order(id: $id) {
+                    id
+                    note
+                }
+            }"""
+            result = shopify_gql(query, {"id": order_gid})
+            current_note = result.get("order", {}).get("note") or ""
+            # Append new note with separator if current note exists
+            if current_note:
+                note = f"{current_note}\n{note}"
+        
+        # Update the order note
+        mutation = """
+        mutation orderUpdate($input: OrderInput!) {
+            orderUpdate(input: $input) {
+                order { id note }
+                userErrors { field message }
+            }
+        }"""
+        result = shopify_gql(mutation, {
+            "input": {
+                "id": order_gid,
+                "note": note
+            }
+        })
+        
+        # Check for user errors
+        errors = result.get("orderUpdate", {}).get("userErrors", [])
+        if errors:
+            print("⚠️  Failed to update order note:")
+            for err in errors:
+                field = err.get("field", [])
+                if isinstance(field, list):
+                    field = ".".join(field)
+                print(f"   Field: {field or 'unknown'} | Message: {err.get('message', 'Unknown error')}")
+            return False
+        
+        return True
+    except Exception as e:
+        print(f"⚠️  Error updating order note: {e}")
+        return False
+
 def order_add_tags(order_gid: str, tags: List[str]) -> bool:
-    """Add tags to an order using Shopify GraphQL"""
+    """Add tags to an order using Shopify GraphQL. Also appends twin check numbers to order notes."""
     if not tags:
         return True
     # Use the generic tagsAdd mutation which works for orders and other taggable resources
@@ -376,6 +425,25 @@ def order_add_tags(order_gid: str, tags: List[str]) -> bool:
         return False
 
     print(f"✅ Tags added: {', '.join(tags)}")
+    
+    # Append twin check numbers to order notes
+    with order_lock:
+        order = current_order_data
+        if order and isinstance(order, dict) and order.get("order_gid") == order_gid:
+            twin_checks = order.get("twin_checks", [])
+            if twin_checks:
+                # Sort and format twin checks
+                twin_checks_sorted = sorted(set(twin_checks))  # Remove duplicates and sort
+                twin_checks_str = ", ".join(twin_checks_sorted)
+                note_text = f"Twin Checks: {twin_checks_str}"
+                
+                if order_update_note(order_gid, note_text, append=True):
+                    print(f"📝 Added twin checks to order notes: {twin_checks_str}")
+                    # Clear twin checks after adding to notes
+                    order["twin_checks"] = []
+                else:
+                    print(f"⚠️  Failed to add twin checks to order notes")
+    
     return True
 
 
@@ -858,7 +926,8 @@ def set_order_gui(order_num_raw: str, tags: Optional[List[str]] = None) -> bool:
             "email": order.get("email", "unknown"),
             "order_node": order,
             "dropbox_root_path": None,  # Will be set after Dropbox operations
-            "dropbox_order_path": None  # Will be set after Dropbox operations
+            "dropbox_order_path": None,  # Will be set after Dropbox operations
+            "twin_checks": []  # Track scan folder names (twin checks) for this order
         }
         if tags_confirmed:
             current_order_data["pending_tags"] = tags_confirmed
@@ -996,7 +1065,8 @@ def set_order() -> None:
                 "email": order.get("email", "unknown"),
                 "order_node": order,
                 "dropbox_root_path": root_path,
-                "dropbox_order_path": order_path
+                "dropbox_order_path": order_path,
+                "twin_checks": []  # Track scan folder names (twin checks) for this order
             }
             if tags_confirmed:
                 current_order_data["pending_tags"] = tags_confirmed
@@ -1085,6 +1155,18 @@ def process_scan(scan_dir: Path) -> None:
             gui_callbacks['upload_completed'](scan_name, uploaded, dest)
         else:
             print(f"[DEBUG] upload_completed callback is None!")
+        
+        # Track twin check (scan folder name) for this order
+        if order.get("mode") != "stage":
+            order_gid = order.get("order_gid")
+            if order_gid:
+                with order_lock:
+                    if current_order_data and isinstance(current_order_data, dict):
+                        if current_order_data.get("order_gid") == order_gid:
+                            # Add twin check to list if not already there
+                            twin_checks = current_order_data.setdefault("twin_checks", [])
+                            if scan_name not in twin_checks:
+                                twin_checks.append(scan_name)
         
         # Mark as processed
         STATE[scan_name] = True
