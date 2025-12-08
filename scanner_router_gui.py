@@ -16,11 +16,11 @@ from PySide6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QTextEdit, QProgressBar,
     QTableWidget, QTableWidgetItem, QGroupBox, QMessageBox,
     QSplitter, QFrame, QMenuBar, QToolBar, QMenu, QDateEdit, QDialog,
-    QDialogButtonBox
+    QDialogButtonBox, QFileDialog
 )
 import re
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QObject, QDate
-from PySide6.QtGui import QFont, QColor, QFontDatabase, QIcon, QAction
+from PySide6.QtGui import QFont, QColor, QFontDatabase, QIcon, QAction, QCursor
 
 # Import the scanner router module
 import scanner_router_direct as router
@@ -156,6 +156,32 @@ class OrderWorker(QObject):
             "email": (order.get("customer") or {}).get("email") or order.get("email") or "unknown"
         }
         self.order_found.emit(order_info)
+    
+    def search_and_set(self, order_input: str):
+        """Search for order and set it immediately without confirmation"""
+        order_num = order_input
+        m = re.match(r"^#?(\d+)(.*)$", order_input)
+        if m:
+            order_num = m.group(1)
+        
+        results = router.shopify_search_orders(f"name:{order_num}")
+        if not results:
+            self.order_not_found.emit(order_input)
+            return
+        
+        # Set the order immediately
+        success = router.set_order_gui(order_input)
+        self.order_set_result.emit(success, order_input)
+        
+        # If successful, get the paths (they might be None initially, will be set async)
+        if success:
+            with router.order_lock:
+                order_data = router.current_order_data
+                if order_data and isinstance(order_data, dict):
+                    root_path = order_data.get("dropbox_root_path")
+                    order_path = order_data.get("dropbox_order_path")
+                    if root_path and order_path:
+                        self.order_paths_ready.emit(root_path, order_path)
     
     def set_order(self, order_input: str):
         """Set the order in background thread - returns immediately, does Dropbox ops async"""
@@ -342,17 +368,55 @@ class ScannerRouterGUI(QMainWindow):
         self.scan_path_label.setText(f"Watching: {new_path}")
         self.log_message(f"Scanner path changed to: {new_path}", "INFO")
     
-    def change_scan_date(self):
-        """Open dialog to change scan date"""
+    def change_scan_folder(self):
+        """Open system folder picker to change scan folder"""
+        current_path = router.get_noritsu_root()
+        
+        # Open system folder picker dialog
+        # Start from current path if it exists, otherwise from base path
+        start_dir = current_path if current_path and Path(current_path).exists() else router.get_noritsu_base()
+        
+        folder_path = QFileDialog.getExistingDirectory(
+            self,
+            "Select Scanner Folder",
+            start_dir,
+            QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.DontResolveSymlinks
+        )
+        
+        if folder_path:
+            # Convert to string and normalize path separators
+            selected_path = str(folder_path)
+            
+            # Try to set the new path
+            if router.set_noritsu_root(selected_path):
+                self.log_message(f"Changed scanner folder to: {selected_path}", "SUCCESS")
+                self.update_scan_path_display()
+                # Worker will pick up the change automatically
+            else:
+                QMessageBox.warning(self, "Invalid Path", 
+                                  f"Cannot access path:\n{selected_path}\n\nPlease check the path exists.")
+    
+    def create_date_folder(self):
+        """Create the date folder for today or selected date"""
+        import os
+        from pathlib import Path
+        
+        base_path = router.get_noritsu_base()
+        if not base_path:
+            QMessageBox.warning(self, "No Base Path", 
+                              "No base path configured. Please set NORITSU_ROOT in your .env file.")
+            return
+        
+        # Ask user which date to create folder for
         dialog = QDialog(self)
-        dialog.setWindowTitle("Change Scanner Date")
+        dialog.setWindowTitle("Create Date Folder")
         dialog.setMinimumWidth(400)
         
         layout = QVBoxLayout()
         dialog.setLayout(layout)
         
         # Instructions
-        info_label = QLabel("Select a date to scan. The path will be:\nBASE_PATH\\YYYYMMDD")
+        info_label = QLabel("Select a date to create the folder for.\nThe folder will be created at:\nBASE_PATH\\YYYYMMDD")
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
         
@@ -366,14 +430,7 @@ class ScannerRouterGUI(QMainWindow):
         date_edit.setDisplayFormat("yyyy-MM-dd")
         layout.addWidget(date_edit)
         
-        # Current path display
-        base_path = router.get_noritsu_base()
-        current_path = router.get_noritsu_root()
-        current_label = QLabel(f"Current: {current_path}")
-        current_label.setWordWrap(True)
-        layout.addWidget(current_label)
-        
-        # Preview new path
+        # Preview path
         preview_label = QLabel("")
         preview_label.setWordWrap(True)
         preview_label.setStyleSheet("color: #0066cc; font-weight: bold;")
@@ -382,17 +439,13 @@ class ScannerRouterGUI(QMainWindow):
         def update_preview():
             selected_date = date_edit.date()
             date_str = selected_date.toString("yyyyMMdd")
-            # Use os.path.join to handle path separators correctly (Windows uses \)
-            import os
-            if base_path:
-                # Preserve UNC path format if it starts with \\
-                if base_path.startswith("\\\\"):
-                    new_path = f"{base_path}\\{date_str}"
-                else:
-                    new_path = os.path.join(base_path, date_str)
+            # Build the full path
+            if base_path.startswith("\\\\"):
+                # Preserve UNC path format
+                full_path = f"{base_path}\\{date_str}"
             else:
-                new_path = date_str
-            preview_label.setText(f"New path: {new_path}")
+                full_path = os.path.join(base_path, date_str)
+            preview_label.setText(f"Will create: {full_path}")
         
         date_edit.dateChanged.connect(update_preview)
         update_preview()  # Initial preview
@@ -406,24 +459,41 @@ class ScannerRouterGUI(QMainWindow):
         if dialog.exec() == QDialog.Accepted:
             selected_date = date_edit.date()
             date_str = selected_date.toString("yyyyMMdd")
-            # Use os.path.join to handle path separators correctly
-            import os
-            if base_path:
-                # Preserve UNC path format if it starts with \\
-                if base_path.startswith("\\\\"):
-                    new_path = f"{base_path}\\{date_str}"
-                else:
-                    new_path = os.path.join(base_path, date_str)
-            else:
-                new_path = date_str
             
-            # Try to set the new path
-            if router.set_noritsu_root(new_path):
-                self.log_message(f"Changed scanner path to: {new_path}", "SUCCESS")
-                # Worker will pick up the change automatically
+            # Build the full path
+            if base_path.startswith("\\\\"):
+                # Preserve UNC path format
+                full_path = f"{base_path}\\{date_str}"
             else:
-                QMessageBox.warning(self, "Invalid Path", 
-                                  f"Cannot access path:\n{new_path}\n\nPlease check the path exists.")
+                full_path = os.path.join(base_path, date_str)
+            
+            try:
+                # Create the folder
+                folder_path = Path(full_path)
+                folder_path.mkdir(parents=True, exist_ok=True)
+                
+                self.log_message(f"✅ Created date folder: {full_path}", "SUCCESS")
+                
+                # Optionally switch to the new folder
+                reply = QMessageBox.question(
+                    self,
+                    "Folder Created",
+                    f"Date folder created successfully:\n{full_path}\n\nSwitch scanner to this folder?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+                
+                if reply == QMessageBox.Yes:
+                    if router.set_noritsu_root(full_path):
+                        self.log_message(f"Switched scanner path to: {full_path}", "SUCCESS")
+                        self.update_scan_path_display()
+                    else:
+                        QMessageBox.warning(self, "Cannot Switch", 
+                                          f"Folder created but cannot switch to it:\n{full_path}")
+            except Exception as e:
+                error_msg = f"Failed to create folder: {e}"
+                self.log_message(f"❌ {error_msg}", "ERROR")
+                QMessageBox.critical(self, "Error", error_msg)
     
     def create_menu_bar(self):
         """Create the menu bar"""
@@ -555,25 +625,39 @@ class ScannerRouterGUI(QMainWindow):
         order_layout = QVBoxLayout()
         
         self.order_number_label = QLabel("No order set")
-        self.order_number_label.setFont(QFont("Arial", 36, QFont.Bold))
+        self.order_number_label.setFont(QFont("Arial", 48, QFont.Bold))
         self.order_number_label.setStyleSheet("""
             QLabel {
                 background-color: white;
                 color: #000000;
-                padding: 15px;
-                border: 2px solid #808080;
+                padding: 20px;
+                border: 3px solid #808080;
+            }
+            QLabel:hover {
+                background-color: #f0f0f0;
             }
         """)
         self.order_number_label.setAlignment(Qt.AlignCenter)
+        self.order_number_label.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))  # Change cursor on hover
+        # Make label accept mouse events
+        self.order_number_label.mousePressEvent = self.on_order_label_clicked
         order_layout.addWidget(self.order_number_label)
         
         self.order_email_label = QLabel("")
-        self.order_email_label.setFont(QFont("Arial", 11, QFont.Bold))
-        self.order_email_label.setStyleSheet("color: #000000;")
+        self.order_email_label.setFont(QFont("Arial", 18, QFont.Bold))
+        self.order_email_label.setStyleSheet("""
+            QLabel {
+                color: #000000;
+                padding: 10px;
+                background-color: #f0f0f0;
+                border: 2px solid #808080;
+            }
+        """)
+        self.order_email_label.setAlignment(Qt.AlignCenter)
         order_layout.addWidget(self.order_email_label)
         
         self.order_status_label = QLabel("")
-        self.order_status_label.setFont(QFont("Arial", 10))
+        self.order_status_label.setFont(QFont("Arial", 12))
         self.order_status_label.setStyleSheet("color: #000000;")
         order_layout.addWidget(self.order_status_label)
         
@@ -668,8 +752,6 @@ class ScannerRouterGUI(QMainWindow):
         self.order_input.setPlaceholderText("Enter order number (e.g., 12345 or 12345s)")
         self.order_input.returnPressed.connect(self.set_order)
         
-        # Track pending order confirmation
-        self.pending_order_info = None
         # Make input field bigger
         input_font = QFont("Arial", 14)
         self.order_input.setFont(input_font)
@@ -682,17 +764,6 @@ class ScannerRouterGUI(QMainWindow):
             }
         """)
         controls_layout.addWidget(self.order_input)
-        
-        # Confirmation message label (shown when order is found, waiting for confirmation)
-        self.order_confirm_label = QLabel("")
-        self.order_confirm_label.setFont(QFont("Arial", 12, QFont.Bold))
-        self.order_confirm_label.setStyleSheet("color: #000000;")
-        self.order_confirm_label.setAlignment(Qt.AlignCenter)
-        self.order_confirm_label.setWordWrap(True)
-        # Enable HTML formatting for the label
-        self.order_confirm_label.setTextFormat(Qt.TextFormat.RichText)  # Enable HTML formatting
-        self.order_confirm_label.hide()  # Hidden by default
-        controls_layout.addWidget(self.order_confirm_label)
         
         self.set_order_btn = QPushButton("Set Order")
         self.set_order_btn.clicked.connect(self.set_order)
@@ -717,6 +788,30 @@ class ScannerRouterGUI(QMainWindow):
         """)
         controls_layout.addWidget(self.set_order_btn)
         
+        # Change Order button (shown when order is set, hidden initially)
+        self.change_order_btn = QPushButton("Change Order")
+        self.change_order_btn.clicked.connect(self.show_order_input)
+        btn_font = QFont("Arial", 12, QFont.Bold)
+        self.change_order_btn.setFont(btn_font)
+        self.change_order_btn.setMinimumHeight(50)
+        self.change_order_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #0066cc;
+                color: white;
+                border: 2px solid #0055aa;
+                padding: 10px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #0055aa;
+            }
+            QPushButton:pressed {
+                background-color: #004499;
+            }
+        """)
+        self.change_order_btn.hide()  # Hidden initially
+        controls_layout.addWidget(self.change_order_btn)
+        
         controls_group.setLayout(controls_layout)
         layout.addWidget(controls_group)
         
@@ -730,9 +825,18 @@ class ScannerRouterGUI(QMainWindow):
         self.scan_path_label.setStyleSheet("color: #000000;")
         path_layout.addWidget(self.scan_path_label)
         
-        change_path_btn = QPushButton("Change Date")
-        change_path_btn.clicked.connect(self.change_scan_date)
-        path_layout.addWidget(change_path_btn)
+        # Buttons layout for date controls
+        date_buttons_layout = QHBoxLayout()
+        
+        create_folder_btn = QPushButton("Create Date Folder")
+        create_folder_btn.clicked.connect(self.create_date_folder)
+        date_buttons_layout.addWidget(create_folder_btn)
+        
+        change_path_btn = QPushButton("Change Folder")
+        change_path_btn.clicked.connect(self.change_scan_folder)
+        date_buttons_layout.addWidget(change_path_btn)
+        
+        path_layout.addLayout(date_buttons_layout)
         
         path_group.setLayout(path_layout)
         layout.addWidget(path_group)
@@ -742,8 +846,8 @@ class ScannerRouterGUI(QMainWindow):
         scans_layout = QVBoxLayout()
         
         self.scans_table = QTableWidget()
-        self.scans_table.setColumnCount(4)
-        self.scans_table.setHorizontalHeaderLabels(["Scan", "Status", "Files", "Time"])
+        self.scans_table.setColumnCount(5)
+        self.scans_table.setHorizontalHeaderLabels(["Scan", "Status", "Files", "Order", "Time"])
         self.scans_table.horizontalHeader().setStretchLastSection(True)
         scans_layout.addWidget(self.scans_table)
         
@@ -838,6 +942,10 @@ class ScannerRouterGUI(QMainWindow):
             self.pending_tags_label.setVisible(False)
             self.change_tags_btn.setEnabled(False)
             self.apply_tags_btn.setEnabled(False)
+            # Show input, hide change button
+            self.order_input.show()
+            self.set_order_btn.show()
+            self.change_order_btn.hide()
             return
         
         if order.get("mode") == "stage":
@@ -855,8 +963,27 @@ class ScannerRouterGUI(QMainWindow):
             if order_no.startswith("#"):
                 order_no = order_no[1:]
             email = order.get("email", "unknown")
+            # Get customer name if available
+            customer_name = ""
+            order_node = order.get("order_node", {})
+            if order_node:
+                customer = order_node.get("customer")
+                if customer:
+                    first_name = customer.get("first_name", "")
+                    last_name = customer.get("last_name", "")
+                    if first_name or last_name:
+                        customer_name = f"{first_name} {last_name}".strip()
+            
             self.order_number_label.setText(f"Order #{order_no}")
-            self.order_email_label.setText(f"Email: {email}")
+            if customer_name:
+                self.order_email_label.setText(f"{customer_name}\n{email}")
+            else:
+                self.order_email_label.setText(email)
+            
+            # Hide input, show change button when order is set
+            self.order_input.hide()
+            self.set_order_btn.hide()
+            self.change_order_btn.show()
             
             pending_tags = order.get("pending_tags", [])
             if pending_tags:
@@ -883,69 +1010,55 @@ class ScannerRouterGUI(QMainWindow):
                 self.order_dropbox_label.setText("Dropbox path not set")
     
     def set_order(self):
-        """Set the order from the input field"""
-        # If we have a pending order confirmation, confirm it immediately (no delay)
-        if self.pending_order_info:
-            order_input = self.pending_order_info["order_input"]
-            self.pending_order_info = None
-            self.order_input.clear()
-            self.order_input.setPlaceholderText("Enter order number (e.g., 12345 or 12345s)")
-            self.order_confirm_label.hide()  # Hide confirmation message
-            self.order_input.setEnabled(False)  # Disable input while processing
-            self.log_message(f"Setting order: {order_input}...", "INFO")
-            # Set the order immediately (no timer delay for faster response)
-            self.order_worker.set_order(order_input)
-            return
-        
-        # Otherwise, get input and search for the order
+        """Set the order from the input field - no confirmation needed"""
+        # Get input and search for the order
         order_input = self.order_input.text().strip()
         if not order_input:
             return
         
-        # Search for the order
-        self.order_input.setEnabled(False)  # Disable input while searching
+        # Disable input while searching
+        self.order_input.setEnabled(False)
+        self.set_order_btn.setEnabled(False)
         self.log_message(f"Searching for order: {order_input}...", "INFO")
         
-        # Search for order in background thread
-        QTimer.singleShot(0, lambda: self.order_worker.search_and_confirm(order_input))
+        # Search for order in background thread - will set immediately when found
+        QTimer.singleShot(0, lambda: self.order_worker.search_and_set(order_input))
+    
+    def show_order_input(self):
+        """Show the order input field and hide the change order button"""
+        self.order_input.show()
+        self.set_order_btn.show()
+        self.change_order_btn.hide()
+        self.order_input.clear()
+        self.order_input.setEnabled(True)
+        self.order_input.setFocus()
+    
+    def on_order_label_clicked(self, event):
+        """Handle click on order number label to change order"""
+        # Only do this if an order is currently set
+        with router.order_lock:
+            order = router.current_order_data
+            if order and order.get("mode") != "stage":
+                self.show_order_input()
+    
+    def focus_order_input(self):
+        """Focus the order input field when order number label is clicked"""
+        # Only do this if an order is currently set
+        with router.order_lock:
+            order = router.current_order_data
+            if order and order.get("mode") != "stage":
+                self.show_order_input()
     
     def on_order_found(self, order_info: dict):
-        """Handle when order is found - show info and wait for confirmation"""
-        order_input = order_info["order_input"]
-        order_no = order_info["order_no"]
-        email = order_info["email"]
-        
-        # Strip any leading '#' from order_no to avoid double #
-        if order_no.startswith("#"):
-            order_no = order_no[1:]
-        
-        # Re-enable input immediately
-        self.order_input.setEnabled(True)
-        
-        # Store pending order info
-        self.pending_order_info = order_info
-        
-        # Show order info in status and log (no popup)
-        # Format the confirmation message with HTML for bold, underlined, black text
-        confirm_msg = f"Found order: #{order_no} ({email}) - <span style='color: black; font-weight: bold; text-decoration: underline;'>Press Enter again to confirm</span>"
-        self.log_message(confirm_msg, "SUCCESS")
-        
-        # Update placeholder to show confirmation needed (plain text for placeholder)
-        self.order_input.setPlaceholderText(f"Found: #{order_no} ({email})")
-        
-        # Show styled confirmation message below input field
-        confirm_text = f"<span style='color: black; font-weight: bold; text-decoration: underline;'>Press Enter to confirm</span>"
-        self.order_confirm_label.setText(confirm_text)
-        self.order_confirm_label.show()
-        
-        self.order_input.clear()  # Clear the input so they can just press Enter
-        self.order_input.setFocus()  # Keep focus so Enter works immediately
+        """Handle when order is found - deprecated, kept for compatibility"""
+        # This method is no longer used but kept for compatibility
+        pass
     
     def on_order_not_found(self, order_input: str):
         """Handle when order is not found - show warning on main thread"""
         self.order_input.setEnabled(True)
+        self.set_order_btn.setEnabled(True)
         self.order_input.setPlaceholderText("Enter order number (e.g., 12345 or 12345s)")
-        self.order_confirm_label.hide()  # Hide confirmation message
         self.log_message(f"❌ No order found for: {order_input}", "ERROR")
         QMessageBox.warning(self, "Order Not Found", f"No order found matching: {order_input}")
     
@@ -1054,15 +1167,18 @@ class ScannerRouterGUI(QMainWindow):
     
     def on_order_set_result(self, success: bool, order_input: str):
         """Handle order set result - show message on main thread"""
-        # Re-enable input
-        self.order_input.setEnabled(True)
-        self.order_input.setPlaceholderText("Enter order number (e.g., 12345 or 12345s)")
-        self.order_confirm_label.hide()  # Hide confirmation message
-        
         if not success:
+            # Re-enable input on failure
+            self.order_input.setEnabled(True)
+            self.set_order_btn.setEnabled(True)
+            self.order_input.setPlaceholderText("Enter order number (e.g., 12345 or 12345s)")
             self.log_message(f"❌ Failed to set order: {order_input}", "ERROR")
             QMessageBox.warning(self, "Error", f"Failed to set order: {order_input}")
         else:
+            # Hide input and show change button on success
+            self.order_input.hide()
+            self.set_order_btn.hide()
+            self.change_order_btn.show()
             self.log_message(f"✅ Order set successfully: {order_input}", "SUCCESS")
     
     def set_staging(self):
@@ -1121,7 +1237,16 @@ class ScannerRouterGUI(QMainWindow):
         """Callback when a scan is detected"""
         try:
             self.log_message(f"📷 Scan detected: {scan_name}", "INFO")
-            self.add_scan_to_table(scan_name, "Detected", 0, datetime.now())
+            # Extract order number from order dict
+            order_no = None
+            if order and isinstance(order, dict):
+                if order.get("mode") == "stage":
+                    order_no = "STAGING"
+                else:
+                    order_no = order.get("order_no", "")
+                    if order_no and order_no.startswith("#"):
+                        order_no = order_no[1:]
+            self.add_scan_to_table(scan_name, "Detected", 0, datetime.now(), order_no)
         except Exception as e:
             error_trace = traceback.format_exc()
             log_error_to_file("on_scan_detected", error_trace)
@@ -1137,7 +1262,18 @@ class ScannerRouterGUI(QMainWindow):
             self.current_upload_label.setText(f"Uploading: {scan_name}")
             self.progress_bar.setValue(0)
             self.progress_status_label.setText("Initializing...")
-            self.update_scan_status(scan_name, "Uploading", 0)
+            # Extract order number from current order or dest path
+            order_no = None
+            with router.order_lock:
+                order = router.current_order_data
+                if order and isinstance(order, dict):
+                    if order.get("mode") == "stage":
+                        order_no = "STAGING"
+                    else:
+                        order_no = order.get("order_no", "")
+                        if order_no and order_no.startswith("#"):
+                            order_no = order_no[1:]
+            self.update_scan_status(scan_name, "Uploading", 0, order_no)
         except Exception as e:
             error_trace = traceback.format_exc()
             log_error_to_file("on_upload_started", error_trace)
@@ -1152,6 +1288,15 @@ class ScannerRouterGUI(QMainWindow):
                 self.progress_status_label.setText(f"{current}/{total} files - {message}")
             else:
                 self.progress_status_label.setText(message)
+            
+            # Log error/warning messages to the log text as well
+            if message and ("error" in message.lower() or "rate limit" in message.lower() or "⚠️" in message or "❌" in message or "waiting" in message.lower()):
+                if "error" in message.lower() or "❌" in message:
+                    self.log_message(f"{scan_name}: {message}", "ERROR")
+                elif "rate limit" in message.lower() or "waiting" in message.lower():
+                    self.log_message(f"{scan_name}: {message}", "WARNING")
+                elif "⚠️" in message:
+                    self.log_message(f"{scan_name}: {message}", "WARNING")
         except Exception as e:
             error_trace = traceback.format_exc()
             log_error_to_file("on_upload_progress", error_trace)
@@ -1167,8 +1312,19 @@ class ScannerRouterGUI(QMainWindow):
             self.current_upload_label.setText("No active upload")
             self.progress_bar.setValue(100)
             self.progress_status_label.setText(f"Completed: {file_count} files uploaded")
+            # Extract order number from current order
+            order_no = None
+            with router.order_lock:
+                order = router.current_order_data
+                if order and isinstance(order, dict):
+                    if order.get("mode") == "stage":
+                        order_no = "STAGING"
+                    else:
+                        order_no = order.get("order_no", "")
+                        if order_no and order_no.startswith("#"):
+                            order_no = order_no[1:]
             # Update scan table
-            self.update_scan_status(scan_name, "Completed", file_count)
+            self.update_scan_status(scan_name, "Completed", file_count, order_no)
             # Reset progress bar after a delay
             QTimer.singleShot(3000, lambda: self.progress_bar.setValue(0))
         except Exception as e:
@@ -1183,17 +1339,43 @@ class ScannerRouterGUI(QMainWindow):
         except Exception as e:
             error_trace = traceback.format_exc()
             log_error_to_file("on_error", error_trace)
-        self.update_scan_status(scan_name, "Error", 0)
+        # Extract order number from current order
+        order_no = None
+        with router.order_lock:
+            order = router.current_order_data
+            if order and isinstance(order, dict):
+                if order.get("mode") == "stage":
+                    order_no = "STAGING"
+                else:
+                    order_no = order.get("order_no", "")
+                    if order_no and order_no.startswith("#"):
+                        order_no = order_no[1:]
+        self.update_scan_status(scan_name, "Error", 0, order_no)
     
-    def add_scan_to_table(self, scan_name: str, status: str, file_count: int, timestamp: datetime):
+    def add_scan_to_table(self, scan_name: str, status: str, file_count: int, timestamp: datetime, order_no: Optional[str] = None):
         """Add or update a scan in the table"""
+        # Get order number if not provided
+        if order_no is None:
+            with router.order_lock:
+                order = router.current_order_data
+                if order and isinstance(order, dict):
+                    if order.get("mode") == "stage":
+                        order_no = "STAGING"
+                    else:
+                        order_no = order.get("order_no", "")
+                        if order_no and order_no.startswith("#"):
+                            order_no = order_no[1:]
+                else:
+                    order_no = ""
+        
         # Check if scan already exists
         for row in range(self.scans_table.rowCount()):
             if self.scans_table.item(row, 0).text() == scan_name:
                 # Update existing row
                 self.scans_table.item(row, 1).setText(status)
                 self.scans_table.item(row, 2).setText(str(file_count))
-                self.scans_table.item(row, 3).setText(timestamp.strftime("%H:%M:%S"))
+                self.scans_table.item(row, 3).setText(order_no or "")
+                self.scans_table.item(row, 4).setText(timestamp.strftime("%H:%M:%S"))
                 return
         
         # Add new row
@@ -1202,17 +1384,35 @@ class ScannerRouterGUI(QMainWindow):
         self.scans_table.setItem(row, 0, QTableWidgetItem(scan_name))
         self.scans_table.setItem(row, 1, QTableWidgetItem(status))
         self.scans_table.setItem(row, 2, QTableWidgetItem(str(file_count)))
-        self.scans_table.setItem(row, 3, QTableWidgetItem(timestamp.strftime("%H:%M:%S")))
+        self.scans_table.setItem(row, 3, QTableWidgetItem(order_no or ""))
+        self.scans_table.setItem(row, 4, QTableWidgetItem(timestamp.strftime("%H:%M:%S")))
         # Scroll to bottom
         self.scans_table.scrollToBottom()
     
-    def update_scan_status(self, scan_name: str, status: str, file_count: int):
+    def update_scan_status(self, scan_name: str, status: str, file_count: int, order_no: Optional[str] = None):
         """Update the status of a scan in the table"""
+        # Get order number if not provided
+        if order_no is None:
+            with router.order_lock:
+                order = router.current_order_data
+                if order and isinstance(order, dict):
+                    if order.get("mode") == "stage":
+                        order_no = "STAGING"
+                    else:
+                        order_no = order.get("order_no", "")
+                        if order_no and order_no.startswith("#"):
+                            order_no = order_no[1:]
+                else:
+                    order_no = ""
+        
         for row in range(self.scans_table.rowCount()):
             if self.scans_table.item(row, 0).text() == scan_name:
                 self.scans_table.item(row, 1).setText(status)
                 self.scans_table.item(row, 2).setText(str(file_count))
-                self.scans_table.item(row, 3).setText(datetime.now().strftime("%H:%M:%S"))
+                # Update order number if provided or if it's empty
+                if order_no or not self.scans_table.item(row, 3).text():
+                    self.scans_table.item(row, 3).setText(order_no or "")
+                self.scans_table.item(row, 4).setText(datetime.now().strftime("%H:%M:%S"))
                 break
     
     def update_status(self, message: str):

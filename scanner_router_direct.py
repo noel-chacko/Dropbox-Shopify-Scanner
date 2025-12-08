@@ -381,13 +381,41 @@ def order_add_tags(order_gid: str, tags: List[str]) -> bool:
 
 # Dropbox helpers (mirroring create_customer_dropbox)
 def _extract_rate_limit_error(e: Exception) -> Optional[RateLimitError]:
-    """Extract RateLimitError from ApiError or return None."""
+    """Extract RateLimitError from ApiError or nested structures."""
     if isinstance(e, RateLimitError):
         return e
     if isinstance(e, ApiError) and hasattr(e, 'error'):
-        if isinstance(e.error, RateLimitError):
-            return e.error
+        error_obj = e.error
+        if isinstance(error_obj, RateLimitError):
+            return error_obj
+        # Handle nested RateLimitError (e.g., RateLimitError containing another RateLimitError)
+        if hasattr(error_obj, 'error') and isinstance(error_obj.error, RateLimitError):
+            return error_obj.error
+    # Check if error message contains rate limit indicators
+    error_str = str(e).lower()
+    if 'rate' in error_str and 'limit' in error_str:
+        # Return the original error if it appears to be rate limit related
+        if isinstance(e, RateLimitError):
+            return e
     return None
+
+def _format_rate_limit_message(error: Exception) -> Tuple[str, str]:
+    """Format a user-friendly rate limit error message.
+    Returns (short_message, detail_message) tuple."""
+    error_str = str(error)
+    
+    # Check for specific rate limit reasons
+    if 'too_many_write_operations' in error_str:
+        short_msg = "Too many write operations"
+        detail_msg = "Dropbox is limiting uploads due to too many simultaneous write operations. Waiting before retry..."
+    elif 'rate' in error_str.lower() and 'limit' in error_str.lower():
+        short_msg = "Rate limit exceeded"
+        detail_msg = "Dropbox rate limit hit. Waiting before retry..."
+    else:
+        short_msg = "Rate limit error"
+        detail_msg = f"Dropbox rate limit: {error_str}"
+    
+    return short_msg, detail_msg
 
 @retry(wait=wait_exponential(multiplier=2, min=2, max=60), stop=stop_after_attempt(5), retry=retry_if_exception_type((RateLimitError, ApiError)))
 def ensure_folder(path: str) -> None:
@@ -569,6 +597,10 @@ def upload_folder(local_dir: Path, dropbox_path: str, progress_callback=None) ->
     """Upload a folder to Dropbox with rate limiting"""
     count = 0
     total_files = 0
+    # Delay between uploads to prevent rate limiting (in seconds)
+    # Very small delay for maximum speed - retry logic handles any rate limits
+    UPLOAD_DELAY = 0.05  # 50ms delay - very fast, retry logic handles rate limits if they occur
+    
     try:
         # Refresh token once at the start for efficiency
         refresh_dbx_if_needed()
@@ -604,20 +636,65 @@ def upload_folder(local_dir: Path, dropbox_path: str, progress_callback=None) ->
         if progress_callback:
             progress_callback(0, total_files, "Starting upload...")
         
-        # Upload files sequentially - retry logic handles rate limits automatically
+        # Upload files sequentially with delay to prevent rate limits
         for idx, (file_path, dropbox_file) in enumerate(files_to_upload):
             try:
                 if progress_callback:
                     progress_callback(idx, total_files, f"Uploading {file_path.name}...")
                 if _upload_single_file(file_path, dropbox_file):
                     count += 1
+                    # Add delay after successful upload to prevent rate limiting
+                    # Skip delay on last file to finish faster
+                    if idx < len(files_to_upload) - 1:
+                        time.sleep(UPLOAD_DELAY)
             except (RateLimitError, ApiError, AuthError) as e:
-                # If retries are exhausted, log and continue to next file
-                error_msg = f"⚠️  Error uploading {file_path.name} after retries: {e}"
-                print(error_msg)
-                log_dropbox_error("Upload File (After Retries)", e, f"File: {file_path}, Dropbox path: {dropbox_file}")
-                if progress_callback:
-                    progress_callback(idx + 1, total_files, error_msg)
+                # Extract rate limit error details
+                rate_limit_err = _extract_rate_limit_error(e)
+                if rate_limit_err:
+                    # Rate limit hit - wait longer before continuing
+                    error_msg = f"⚠️  Rate limit error uploading {file_path.name} - waiting before retry..."
+                    print(error_msg)
+                    if progress_callback:
+                        progress_callback(idx, total_files, error_msg)
+                    log_dropbox_error("Upload File (Rate Limit)", e, f"File: {file_path}, Dropbox path: {dropbox_file}")
+                    # Wait longer for rate limits (15-30 seconds)
+                    wait_time = 15
+                    # Try to extract retry_after if available
+                    if hasattr(rate_limit_err, 'retry_after') and rate_limit_err.retry_after is not None:
+                        try:
+                            wait_time = max(wait_time, int(rate_limit_err.retry_after))
+                        except (ValueError, TypeError):
+                            pass
+                    print(f"   Waiting {wait_time} seconds before continuing...")
+                    if progress_callback:
+                        progress_callback(idx, total_files, f"Rate limit - waiting {wait_time}s...")
+                    time.sleep(wait_time)
+                    # Retry the upload after waiting
+                    try:
+                        if progress_callback:
+                            progress_callback(idx, total_files, f"Retrying {file_path.name}...")
+                        if _upload_single_file(file_path, dropbox_file):
+                            count += 1
+                            if idx < len(files_to_upload) - 1:
+                                time.sleep(UPLOAD_DELAY)
+                        else:
+                            error_msg = f"⚠️  Failed to upload {file_path.name} after rate limit wait"
+                            print(error_msg)
+                            if progress_callback:
+                                progress_callback(idx + 1, total_files, error_msg)
+                    except Exception as retry_e:
+                        error_msg = f"⚠️  Error uploading {file_path.name} after rate limit retry: {retry_e}"
+                        print(error_msg)
+                        log_dropbox_error("Upload File (Rate Limit Retry Failed)", retry_e, f"File: {file_path}, Dropbox path: {dropbox_file}")
+                        if progress_callback:
+                            progress_callback(idx + 1, total_files, error_msg)
+                else:
+                    # Other API error after retries exhausted
+                    error_msg = f"⚠️  Error uploading {file_path.name} after retries: {e}"
+                    print(error_msg)
+                    log_dropbox_error("Upload File (After Retries)", e, f"File: {file_path}, Dropbox path: {dropbox_file}")
+                    if progress_callback:
+                        progress_callback(idx + 1, total_files, error_msg)
             except Exception as e:
                 error_msg = f"Error uploading {file_path}: {e}"
                 print(error_msg)
@@ -635,11 +712,42 @@ def upload_folder(local_dir: Path, dropbox_path: str, progress_callback=None) ->
                     count += 1
                     print(f"✅ Added WPPC.jpg to folder")
             except (RateLimitError, ApiError) as e:
-                error_msg = f"⚠️  Rate limit error uploading WPPC.jpg after retries: {e}"
-                print(error_msg)
-                log_dropbox_error("Upload WPPC.jpg (After Retries)", e, f"Dropbox path: {wppc_dropbox_path}")
-                if progress_callback:
-                    progress_callback(total_files, total_files, error_msg)
+                rate_limit_err = _extract_rate_limit_error(e)
+                if rate_limit_err:
+                    error_msg = f"⚠️  Rate limit error uploading WPPC.jpg - waiting before retry..."
+                    print(error_msg)
+                    if progress_callback:
+                        progress_callback(len(files_to_upload), total_files, error_msg)
+                    log_dropbox_error("Upload WPPC.jpg (Rate Limit)", e, f"Dropbox path: {wppc_dropbox_path}")
+                    wait_time = 15
+                    if hasattr(rate_limit_err, 'retry_after') and rate_limit_err.retry_after is not None:
+                        try:
+                            wait_time = max(wait_time, int(rate_limit_err.retry_after))
+                        except (ValueError, TypeError):
+                            pass
+                    print(f"   Waiting {wait_time} seconds before retrying WPPC.jpg...")
+                    if progress_callback:
+                        progress_callback(len(files_to_upload), total_files, f"Rate limit - waiting {wait_time}s...")
+                    time.sleep(wait_time)
+                    # Retry WPPC.jpg upload
+                    try:
+                        if progress_callback:
+                            progress_callback(len(files_to_upload), total_files, "Retrying WPPC.jpg...")
+                        if _upload_single_file(wppc_path, wppc_dropbox_path):
+                            count += 1
+                            print(f"✅ Added WPPC.jpg to folder (after retry)")
+                    except Exception as retry_e:
+                        error_msg = f"⚠️  Failed to upload WPPC.jpg after rate limit retry: {retry_e}"
+                        print(error_msg)
+                        log_dropbox_error("Upload WPPC.jpg (Rate Limit Retry Failed)", retry_e, f"Dropbox path: {wppc_dropbox_path}")
+                        if progress_callback:
+                            progress_callback(total_files, total_files, error_msg)
+                else:
+                    error_msg = f"⚠️  Rate limit error uploading WPPC.jpg after retries: {e}"
+                    print(error_msg)
+                    log_dropbox_error("Upload WPPC.jpg (After Retries)", e, f"Dropbox path: {wppc_dropbox_path}")
+                    if progress_callback:
+                        progress_callback(total_files, total_files, error_msg)
             except Exception as e:
                 error_msg = f"⚠️  Error uploading WPPC.jpg: {e}"
                 print(error_msg)
@@ -653,8 +761,9 @@ def upload_folder(local_dir: Path, dropbox_path: str, progress_callback=None) ->
             progress_callback(total_files, total_files, f"✅ Uploaded {count} files")
                 
     except Exception as e:
-        error_msg = f"Error processing folder {local_dir}: {e}"
+        error_msg = f"❌ Error processing folder {local_dir}: {e}"
         print(error_msg)
+        log_dropbox_error("Upload Folder (Exception)", e, f"Folder: {local_dir}, Dropbox path: {dropbox_path}")
         if progress_callback:
             progress_callback(0, 0, error_msg)
     
@@ -904,6 +1013,9 @@ def process_scan(scan_dir: Path) -> None:
         gui_callbacks['scan_detected'](scan_name, order)
     
     # Upload based on order
+    dest = None  # Initialize dest for error handling
+    progress_cb = None  # Initialize progress_cb for error handling
+    
     try:
         if order.get("mode") == "stage":
             dest = f"{DROPBOX_ROOT}/_staging/{scan_name}"
@@ -924,13 +1036,24 @@ def process_scan(scan_dir: Path) -> None:
             gui_callbacks['upload_started'](scan_name, dest)
         
         # Create progress callback if GUI is active
-        progress_cb = None
         if gui_callbacks['upload_progress']:
             def progress(current, total, message):
                 gui_callbacks['upload_progress'](scan_name, current, total, message)
             progress_cb = progress
         
         uploaded = upload_folder(scan_dir, dest, progress_cb)
+        
+        # Check if upload was successful (some files uploaded) or completely failed
+        if uploaded == 0:
+            error_msg = f"⚠️  No files uploaded for {scan_name}. Check logs for details."
+            print(error_msg)
+            if progress_cb:
+                progress_cb(0, 0, error_msg)
+            if gui_callbacks['error']:
+                gui_callbacks['error'](scan_name, error_msg)
+            # Don't mark as processed if nothing was uploaded
+            return
+        
         print(f"✅ Uploaded {uploaded} files")
         
         # Notify GUI that upload is complete
@@ -944,22 +1067,89 @@ def process_scan(scan_dir: Path) -> None:
         save_state(STATE)
         
     except RateLimitError as e:
-        error_msg = f"❌ Rate limit error processing {scan_name}: {e}"
+        # Extract rate limit details
+        rate_limit_err = _extract_rate_limit_error(e) if not isinstance(e, RateLimitError) else e
+        error_details = str(e)
+        
+        # Check if it's a "too_many_write_operations" error
+        if 'too_many_write_operations' in error_details:
+            error_msg = f"❌ Rate limit error: Too many write operations for {scan_name}"
+            detail_msg = "Dropbox is limiting uploads due to too many simultaneous operations. Waiting before retry..."
+        else:
+            error_msg = f"❌ Rate limit error processing {scan_name}"
+            detail_msg = f"Dropbox rate limit hit: {error_details}"
+        
         print(error_msg)
-        print("   Waiting 10 seconds before retrying...")
-        log_dropbox_error("Process Scan (Rate Limit)", e, f"Scan: {scan_name}, Destination: {dest}")
+        print(f"   {detail_msg}")
+        
+        # Determine wait time
+        wait_time = 30  # Default longer wait for rate limits
+        if rate_limit_err and hasattr(rate_limit_err, 'retry_after') and rate_limit_err.retry_after is not None:
+            try:
+                wait_time = max(wait_time, int(rate_limit_err.retry_after))
+            except (ValueError, TypeError):
+                pass
+        
+        print(f"   Waiting {wait_time} seconds before retrying...")
+        
+        # Log the error
+        log_dropbox_error("Process Scan (Rate Limit)", e, f"Scan: {scan_name}, Destination: {dest or 'unknown'}")
+        
+        # Notify GUI through error callback
         if gui_callbacks['error']:
-            gui_callbacks['error'](scan_name, error_msg)
-        time.sleep(10)
+            gui_callbacks['error'](scan_name, f"{error_msg} - {detail_msg}")
+        # Also notify through progress callback if available
+        if progress_cb:
+            progress_cb(0, 0, f"Rate limit - waiting {wait_time}s before retry...")
+        
+        time.sleep(wait_time)
         # Don't mark as processed, so it will be retried
     except Exception as e:
+        # Check if it's a nested RateLimitError
+        rate_limit_err = _extract_rate_limit_error(e)
+        if rate_limit_err:
+            # Handle as rate limit error
+            error_details = str(e)
+            if 'too_many_write_operations' in error_details:
+                error_msg = f"❌ Rate limit error: Too many write operations for {scan_name}"
+                detail_msg = "Dropbox is limiting uploads. The upload will be retried automatically."
+            else:
+                error_msg = f"❌ Rate limit error processing {scan_name}"
+                detail_msg = f"Error: {error_details}"
+            
+            print(error_msg)
+            print(f"   {detail_msg}")
+            
+            wait_time = 30
+            if hasattr(rate_limit_err, 'retry_after') and rate_limit_err.retry_after is not None:
+                try:
+                    wait_time = max(wait_time, int(rate_limit_err.retry_after))
+                except (ValueError, TypeError):
+                    pass
+            
+            print(f"   Waiting {wait_time} seconds before retrying...")
+            log_dropbox_error("Process Scan (Rate Limit - Nested)", rate_limit_err, f"Scan: {scan_name}, Destination: {dest or 'unknown'}")
+            
+            if gui_callbacks['error']:
+                gui_callbacks['error'](scan_name, f"{error_msg} - {detail_msg}")
+            if progress_cb:
+                progress_cb(0, 0, f"Rate limit - waiting {wait_time}s...")
+            
+            time.sleep(wait_time)
+            return  # Don't mark as processed
+        
+        # Regular exception handling
         error_msg = f"❌ Error processing {scan_name}: {e}"
         print(error_msg)
+        
         # Only log Dropbox-related errors to the Dropbox log
         if isinstance(e, (ApiError, RateLimitError, AuthError)):
-            log_dropbox_error("Process Scan (Exception)", e, f"Scan: {scan_name}, Destination: {dest}")
+            log_dropbox_error("Process Scan (Exception)", e, f"Scan: {scan_name}, Destination: {dest or 'unknown'}")
+        
         if gui_callbacks['error']:
             gui_callbacks['error'](scan_name, error_msg)
+        if progress_cb:
+            progress_cb(0, 0, error_msg)
 
 def main():
     print("\n" + "="*60)
