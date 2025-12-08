@@ -479,7 +479,28 @@ def make_shared_link(path: str) -> Optional[str]:
             return None
 
 
+def _create_link_and_update_shopify_background(root_path: str, customer_gid: str, email: str):
+    """Background task to create shared link and update Shopify metafield.
+    This runs in a separate thread and doesn't block folder creation."""
+    try:
+        link = make_shared_link(root_path)
+        if link and customer_gid:
+            if set_customer_dropbox_link(customer_gid, link):
+                print(f"💾 Shopify metafield updated for {email}")
+            else:
+                print(f"⚠️  Metafield update failed for {email}; please verify in Shopify.")
+        elif customer_gid and not link:
+            print(f"⚠️  Could not create shared link for {root_path}; Shopify metafield not updated.")
+    except Exception as e:
+        # Log error but don't crash - folders are already created
+        error_msg = f"Background task failed for {email}: {e}"
+        print(f"⚠️  {error_msg}")
+        log_dropbox_error("Background Link Creation", e, f"Root path: {root_path}, Email: {email}")
+
+
 def ensure_customer_order_folder(order_node: Dict[str, Any]) -> Tuple[str, str]:
+    """Create customer and order folders. Returns immediately after folder creation.
+    Shared link creation and Shopify update happen in background for new customers."""
     customer = order_node.get("customer") or {}
     email = (customer.get("email") or order_node.get("email") or "unknown").strip().lower()
     customer_gid = customer.get("id")
@@ -502,15 +523,18 @@ def ensure_customer_order_folder(order_node: Dict[str, Any]) -> Tuple[str, str]:
         # Use DROPBOX_ROOT directly from .env file (simple approach like old code)
         root_path = f"{DROPBOX_ROOT}/{email}"
         ensure_tree(root_path)
-
-        link = make_shared_link(root_path)
-        if link and customer_gid:
-            if set_customer_dropbox_link(customer_gid, link):
-                print(f"💾 Shopify metafield updated for {email}")
-            else:
-                print("⚠️  Metafield update failed; please verify in Shopify.")
-        elif customer_gid and not link:
-            print(f"⚠️  Could not create shared link for {root_path}; Shopify metafield not updated.")
+        
+        # Queue background task to create shared link and update Shopify (non-blocking)
+        # Folders are already created, so uploads can proceed immediately
+        if customer_gid:
+            thread = threading.Thread(
+                target=_create_link_and_update_shopify_background,
+                args=(root_path, customer_gid, email),
+                daemon=True,  # Daemon thread won't prevent program exit
+                name=f"LinkCreation-{email}"
+            )
+            thread.start()
+            print(f"📁 Folders created for {email}, creating shared link in background...")
 
     order_number = (order_node.get("name") or "").replace('#', '').strip()
     if not order_number:
