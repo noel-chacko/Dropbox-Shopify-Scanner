@@ -788,30 +788,6 @@ class ScannerRouterGUI(QMainWindow):
         """)
         controls_layout.addWidget(self.set_order_btn)
         
-        # Change Order button (shown when order is set, hidden initially)
-        self.change_order_btn = QPushButton("Change Order")
-        self.change_order_btn.clicked.connect(self.show_order_input)
-        btn_font = QFont("Arial", 12, QFont.Bold)
-        self.change_order_btn.setFont(btn_font)
-        self.change_order_btn.setMinimumHeight(50)
-        self.change_order_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #0066cc;
-                color: white;
-                border: 2px solid #0055aa;
-                padding: 10px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #0055aa;
-            }
-            QPushButton:pressed {
-                background-color: #004499;
-            }
-        """)
-        self.change_order_btn.hide()  # Hidden initially
-        controls_layout.addWidget(self.change_order_btn)
-        
         controls_group.setLayout(controls_layout)
         layout.addWidget(controls_group)
         
@@ -942,10 +918,6 @@ class ScannerRouterGUI(QMainWindow):
             self.pending_tags_label.setVisible(False)
             self.change_tags_btn.setEnabled(False)
             self.apply_tags_btn.setEnabled(False)
-            # Show input, hide change button
-            self.order_input.show()
-            self.set_order_btn.show()
-            self.change_order_btn.hide()
             return
         
         if order.get("mode") == "stage":
@@ -979,11 +951,6 @@ class ScannerRouterGUI(QMainWindow):
                 self.order_email_label.setText(f"{customer_name}\n{email}")
             else:
                 self.order_email_label.setText(email)
-            
-            # Hide input, show change button when order is set
-            self.order_input.hide()
-            self.set_order_btn.hide()
-            self.change_order_btn.show()
             
             pending_tags = order.get("pending_tags", [])
             if pending_tags:
@@ -1024,30 +991,12 @@ class ScannerRouterGUI(QMainWindow):
         # Search for order in background thread - will set immediately when found
         QTimer.singleShot(0, lambda: self.order_worker.search_and_set(order_input))
     
-    def show_order_input(self):
-        """Show the order input field and hide the change order button"""
-        self.order_input.show()
-        self.set_order_btn.show()
-        self.change_order_btn.hide()
+    def on_order_label_clicked(self, event):
+        """Handle click on order number label to focus input field"""
+        # Clear input and focus it so user can type new order number
         self.order_input.clear()
-        self.order_input.setEnabled(True)
         self.order_input.setFocus()
     
-    def on_order_label_clicked(self, event):
-        """Handle click on order number label to change order"""
-        # Only do this if an order is currently set
-        with router.order_lock:
-            order = router.current_order_data
-            if order and order.get("mode") != "stage":
-                self.show_order_input()
-    
-    def focus_order_input(self):
-        """Focus the order input field when order number label is clicked"""
-        # Only do this if an order is currently set
-        with router.order_lock:
-            order = router.current_order_data
-            if order and order.get("mode") != "stage":
-                self.show_order_input()
     
     def on_order_found(self, order_info: dict):
         """Handle when order is found - deprecated, kept for compatibility"""
@@ -1175,10 +1124,10 @@ class ScannerRouterGUI(QMainWindow):
             self.log_message(f"❌ Failed to set order: {order_input}", "ERROR")
             QMessageBox.warning(self, "Error", f"Failed to set order: {order_input}")
         else:
-            # Hide input and show change button on success
-            self.order_input.hide()
-            self.set_order_btn.hide()
-            self.change_order_btn.show()
+            # Clear input and keep it visible for next order
+            self.order_input.clear()
+            self.order_input.setEnabled(True)
+            self.set_order_btn.setEnabled(True)
             self.log_message(f"✅ Order set successfully: {order_input}", "SUCCESS")
     
     def set_staging(self):
