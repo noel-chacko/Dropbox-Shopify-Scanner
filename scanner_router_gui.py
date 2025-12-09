@@ -65,6 +65,22 @@ class ScannerWorker(QThread):
         
     def update_path(self, new_path: str):
         """Update the scan path and reset existing folders"""
+        # Normalize paths to avoid spurious changes due to separators/casing
+        try:
+            new_norm = os.path.normcase(os.path.normpath(new_path))
+        except Exception:
+            new_norm = new_path
+        cur_norm = None
+        if self.current_root is not None:
+            try:
+                cur_norm = os.path.normcase(os.path.normpath(str(self.current_root)))
+            except Exception:
+                cur_norm = str(self.current_root)
+        
+        # If normalized paths are identical, don't treat it as a change
+        if cur_norm == new_norm:
+            return
+        
         self.current_root = Path(new_path)
         self.existing_folders = set()
         if self.current_root.exists():
@@ -83,9 +99,19 @@ class ScannerWorker(QThread):
         
         while self.running:
             try:
-                # Check if path has changed
+                # Check if path has changed (compare normalized forms)
                 new_path = router.get_noritsu_root()
-                if str(self.current_root) != new_path:
+                try:
+                    new_norm = os.path.normcase(os.path.normpath(new_path))
+                except Exception:
+                    new_norm = new_path
+                cur_norm = None
+                if self.current_root is not None:
+                    try:
+                        cur_norm = os.path.normcase(os.path.normpath(str(self.current_root)))
+                    except Exception:
+                        cur_norm = str(self.current_root)
+                if cur_norm != new_norm:
                     self.update_path(new_path)
                 
                 if time.time() - last_scan < router.SCAN_INTERVAL:
@@ -204,8 +230,70 @@ class ScannerRouterGUI(QMainWindow):
         self.setWindowTitle("Scanner Router - Direct")
         self.setGeometry(100, 100, 1080, 720)  # 10% smaller than original (1200x800)
         
-        # Set industrial grey color scheme with better readability
-        self.setStyleSheet("""
+        # Theme state (False = light, True = terminal)
+        self.dark_mode = False
+        
+        # Set initial theme (light/industrial grey) - this sets the global stylesheet
+        self.apply_theme()
+        
+        # Create UI first (so all widgets exist)
+        self.init_ui()
+        
+        # Re-apply theme to ensure widget-specific styles are set after widgets are created
+        self.apply_theme()
+        
+        # Create menu bar and toolbar after UI is created
+        self.create_menu_bar()
+        self.create_toolbar()
+        
+        # Create order worker thread
+        self.order_worker_thread = QThread()
+        self.order_worker = OrderWorker()
+        self.order_worker.moveToThread(self.order_worker_thread)
+        self.order_worker.order_found.connect(self.on_order_found)
+        self.order_worker.order_not_found.connect(self.on_order_not_found)
+        self.order_worker.order_set_result.connect(self.on_order_set_result)
+        self.order_worker.order_paths_ready.connect(self.on_order_paths_ready)
+        self.order_worker_thread.start()
+        
+        # Start scanner worker thread
+        self.worker = ScannerWorker()
+        self.worker.status_update.connect(self.update_status)
+        self.worker.error_occurred.connect(self.show_error)
+        self.worker.path_changed.connect(self.on_scan_path_changed)
+        # Connect worker signals for upload callbacks (thread-safe)
+        self.worker.upload_started_signal.connect(self.on_upload_started)
+        self.worker.upload_progress_signal.connect(self.on_upload_progress)
+        self.worker.upload_completed_signal.connect(self.on_upload_completed)
+        self.worker.scan_detected_signal.connect(self.on_scan_detected)
+        self.worker.start()
+        
+        # Setup GUI callbacks (after worker is created)
+        self.setup_callbacks()
+        
+        # Update timer for refreshing order info
+        self.update_timer = QTimer()
+        self.update_timer.timeout.connect(self.refresh_order_info)
+        self.update_timer.start(1000)  # Update every second
+        
+        # Initial order info refresh
+        self.refresh_order_info()
+        
+        # Update scan path display (will show auto-set date path)
+        self.update_scan_path_display()
+        
+        # Log that path was auto-set to today's date
+        current_path = router.get_noritsu_root()
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        if today_str.replace("-", "") in current_path.replace("\\", "/"):
+            self.log_message(f"Scanner path auto-set to today's date: {current_path}", "INFO")
+        
+        # Add theme toggle button (after UI is created)
+        self.create_theme_toggle_button()
+    
+    def get_light_theme(self) -> str:
+        """Get the light/industrial grey theme stylesheet"""
+        return """
             QMainWindow {
                 background-color: #d3d3d3;
                 color: #000000;
@@ -307,56 +395,332 @@ class ScannerRouterGUI(QMainWindow):
                 background-color: #c0c0c0;
                 border: 1px solid #808080;
             }
-        """)
+        """
+    
+    def get_dark_theme(self) -> str:
+        """Get the terminal/green theme stylesheet"""
+        return """
+            QMainWindow {
+                background-color: #0d1117;
+                color: #00ff41;
+            }
+            QWidget {
+                background-color: #0d1117;
+                color: #00ff41;
+            }
+            QLabel {
+                color: #00ff41;
+            }
+            QGroupBox {
+                font-weight: bold;
+                font-size: 11pt;
+                color: #39ff14;
+                border: 1px solid #00ff41;
+                border-radius: 4px;
+                margin-top: 10px;
+                padding-top: 10px;
+                background-color: #161b22;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+                color: #39ff14;
+            }
+            QLineEdit {
+                background-color: #161b22;
+                color: #00ff41;
+                border: 1px solid #00ff41;
+                border-radius: 2px;
+                padding: 5px;
+                font-size: 11pt;
+            }
+            QLineEdit:focus {
+                border: 2px solid #39ff14;
+                background-color: #1a1f28;
+            }
+            QPushButton {
+                background-color: #161b22;
+                color: #00ff41;
+                border: 1px solid #00ff41;
+                border-radius: 2px;
+                padding: 5px 15px;
+                min-height: 25px;
+                font-size: 11pt;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #1a1f28;
+                border: 2px solid #39ff14;
+                color: #39ff14;
+            }
+            QPushButton:pressed {
+                background-color: #0d1117;
+                border: 1px solid #00ff41;
+            }
+            QTableWidget {
+                background-color: #161b22;
+                color: #00ff41;
+                border: 1px solid #00ff41;
+                border-radius: 2px;
+                gridline-color: #00ff41;
+                font-size: 10pt;
+            }
+            QTableWidget::item {
+                color: #00ff41;
+            }
+            QTableWidget::item:selected {
+                background-color: #00ff41;
+                color: #0d1117;
+            }
+            QHeaderView::section {
+                background-color: #161b22;
+                color: #39ff14;
+                font-weight: bold;
+                padding: 4px;
+                border: 1px solid #00ff41;
+            }
+            QTextEdit {
+                background-color: #161b22;
+                color: #00ff41;
+                border: 1px solid #00ff41;
+                border-radius: 2px;
+                font-size: 10pt;
+            }
+            QProgressBar {
+                border: 1px solid #00ff41;
+                background-color: #161b22;
+                color: #00ff41;
+                text-align: center;
+                font-size: 10pt;
+                border-radius: 2px;
+            }
+            QProgressBar::chunk {
+                background-color: #00ff41;
+                border-radius: 2px;
+            }
+            QMenuBar {
+                background-color: #161b22;
+                color: #00ff41;
+                font-size: 11pt;
+            }
+            QMenuBar::item:selected {
+                background-color: #1a1f28;
+                color: #39ff14;
+            }
+            QMenu {
+                background-color: #161b22;
+                color: #00ff41;
+                border: 1px solid #00ff41;
+                border-radius: 2px;
+            }
+            QMenu::item:selected {
+                background-color: #00ff41;
+                color: #0d1117;
+            }
+            QToolBar {
+                background-color: #161b22;
+                border: 1px solid #00ff41;
+            }
+        """
+    
+    def apply_theme(self):
+        """Apply the current theme (light or dark)"""
+        if self.dark_mode:
+            stylesheet = self.get_dark_theme()
+        else:
+            stylesheet = self.get_light_theme()
+        self.setStyleSheet(stylesheet)
         
-        # Create UI first (so all widgets exist)
-        self.init_ui()
+        # Update theme button style and icon
+        if hasattr(self, 'theme_toggle_btn'):
+            self.update_theme_button_style()
+            self.update_theme_button_icon()
         
-        # Create menu bar and toolbar after UI is created
-        self.create_menu_bar()
-        self.create_toolbar()
+        # Update specific widget styles that need custom overrides
+        if hasattr(self, 'order_number_label'):
+            if self.dark_mode:
+                self.order_number_label.setStyleSheet("""
+                    QLabel {
+                        background-color: #161b22;
+                        color: #00ff41;
+                        padding: 20px;
+                        border: 3px solid #00ff41;
+                        border-radius: 4px;
+                    }
+                    QLabel:hover {
+                        background-color: #1a1f28;
+                        border: 3px solid #39ff14;
+                        color: #39ff14;
+                    }
+                """)
+            else:
+                self.order_number_label.setStyleSheet("""
+                    QLabel {
+                        background-color: white;
+                        color: #000000;
+                        padding: 20px;
+                        border: 3px solid #808080;
+                    }
+                    QLabel:hover {
+                        background-color: #f0f0f0;
+                    }
+                """)
         
-        # Create order worker thread
-        self.order_worker_thread = QThread()
-        self.order_worker = OrderWorker()
-        self.order_worker.moveToThread(self.order_worker_thread)
-        self.order_worker.order_found.connect(self.on_order_found)
-        self.order_worker.order_not_found.connect(self.on_order_not_found)
-        self.order_worker.order_set_result.connect(self.on_order_set_result)
-        self.order_worker.order_paths_ready.connect(self.on_order_paths_ready)
-        self.order_worker_thread.start()
+        if hasattr(self, 'order_email_label'):
+            if self.dark_mode:
+                self.order_email_label.setStyleSheet("""
+                    QLabel {
+                        color: #00ff41;
+                        padding: 10px;
+                        background-color: #161b22;
+                        border: 2px solid #00ff41;
+                        border-radius: 2px;
+                    }
+                """)
+            else:
+                self.order_email_label.setStyleSheet("""
+                    QLabel {
+                        color: #000000;
+                        padding: 10px;
+                        background-color: #f0f0f0;
+                        border: 2px solid #808080;
+                    }
+                """)
         
-        # Start scanner worker thread
-        self.worker = ScannerWorker()
-        self.worker.status_update.connect(self.update_status)
-        self.worker.error_occurred.connect(self.show_error)
-        self.worker.path_changed.connect(self.on_scan_path_changed)
-        # Connect worker signals for upload callbacks (thread-safe)
-        self.worker.upload_started_signal.connect(self.on_upload_started)
-        self.worker.upload_progress_signal.connect(self.on_upload_progress)
-        self.worker.upload_completed_signal.connect(self.on_upload_completed)
-        self.worker.scan_detected_signal.connect(self.on_scan_detected)
-        self.worker.start()
+        if hasattr(self, 'pending_tags_label'):
+            if self.dark_mode:
+                self.pending_tags_label.setStyleSheet("""
+                    color: #39ff14;
+                    background-color: #0d1a0d;
+                    padding: 8px;
+                    border: 2px solid #00ff41;
+                    border-radius: 2px;
+                """)
+            else:
+                self.pending_tags_label.setStyleSheet("""
+                    color: #0066cc;
+                    background-color: #e8f4f8;
+                    padding: 8px;
+                    border: 2px solid #0066cc;
+                    border-radius: 3px;
+                """)
         
-        # Setup GUI callbacks (after worker is created)
-        self.setup_callbacks()
+        # Update other labels with simple color styles
+        if hasattr(self, 'order_status_label'):
+            if self.dark_mode:
+                self.order_status_label.setStyleSheet("color: #00ff41;")
+            else:
+                self.order_status_label.setStyleSheet("color: #000000;")
         
-        # Update timer for refreshing order info
-        self.update_timer = QTimer()
-        self.update_timer.timeout.connect(self.refresh_order_info)
-        self.update_timer.start(1000)  # Update every second
+        if hasattr(self, 'order_dropbox_label'):
+            if self.dark_mode:
+                self.order_dropbox_label.setStyleSheet("color: #00ff41;")
+            else:
+                self.order_dropbox_label.setStyleSheet("color: #000000;")
         
-        # Initial order info refresh
-        self.refresh_order_info()
+        if hasattr(self, 'scan_path_label'):
+            if self.dark_mode:
+                self.scan_path_label.setStyleSheet("color: #00ff41;")
+            else:
+                self.scan_path_label.setStyleSheet("color: #000000;")
         
-        # Update scan path display (will show auto-set date path)
-        self.update_scan_path_display()
+        if hasattr(self, 'current_upload_label'):
+            if self.dark_mode:
+                self.current_upload_label.setStyleSheet("color: #00ff41;")
+            else:
+                self.current_upload_label.setStyleSheet("color: #000000;")
         
-        # Log that path was auto-set to today's date
-        current_path = router.get_noritsu_root()
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        if today_str.replace("-", "") in current_path.replace("\\", "/"):
-            self.log_message(f"Scanner path auto-set to today's date: {current_path}", "INFO")
+        if hasattr(self, 'progress_status_label'):
+            if self.dark_mode:
+                self.progress_status_label.setStyleSheet("color: #00ff41;")
+            else:
+                self.progress_status_label.setStyleSheet("color: #000000;")
+    
+    def toggle_theme(self):
+        """Toggle between light and terminal themes"""
+        self.dark_mode = not self.dark_mode
+        self.apply_theme()
+        self.update_theme_button_icon()
+        theme_name = "Terminal Mode" if self.dark_mode else "Light Mode"
+        self.log_message(f"Theme changed to: {theme_name}", "INFO")
+    
+    def update_theme_button_icon(self):
+        """Update the theme toggle button icon based on current theme"""
+        if hasattr(self, 'theme_toggle_btn'):
+            if self.dark_mode:
+                self.theme_toggle_btn.setText("☀️")  # Sun icon for light mode (to toggle to)
+                self.theme_toggle_btn.setToolTip("Switch to Light Mode")
+            else:
+                self.theme_toggle_btn.setText("🖥️")  # Terminal icon for terminal mode (to toggle to)
+                self.theme_toggle_btn.setToolTip("Switch to Terminal Mode")
+    
+    def create_theme_toggle_button(self):
+        """Create a small theme toggle button in the bottom right corner"""
+        # Create button
+        self.theme_toggle_btn = QPushButton("🖥️", self)
+        self.theme_toggle_btn.setFixedSize(32, 32)
+        self.theme_toggle_btn.setToolTip("Switch to Terminal Mode")
+        self.theme_toggle_btn.clicked.connect(self.toggle_theme)
+        
+        # Set initial icon
+        self.update_theme_button_icon()
+        
+        # Style the button to be small and unobtrusive
+        self.update_theme_button_style()
+        
+        # Position button in bottom right corner
+        # We'll update position on resize events
+        self.update_theme_button_position()
+        
+        # Connect resize event to update button position
+        if not hasattr(self, 'resizeEvent_original'):
+            self.resizeEvent_original = self.resizeEvent
+            def new_resize_event(event):
+                self.resizeEvent_original(event)
+                self.update_theme_button_position()
+            self.resizeEvent = new_resize_event
+    
+    def update_theme_button_style(self):
+        """Update button styling to match current theme"""
+        if hasattr(self, 'theme_toggle_btn'):
+            if self.dark_mode:
+                self.theme_toggle_btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: rgba(22, 27, 34, 220);
+                        border: 1px solid rgba(0, 255, 65, 200);
+                        border-radius: 16px;
+                        font-size: 16px;
+                    }
+                    QPushButton:hover {
+                        background-color: rgba(26, 31, 40, 240);
+                        border: 2px solid #39ff14;
+                    }
+                """)
+            else:
+                self.theme_toggle_btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: rgba(200, 200, 200, 200);
+                        border: 1px solid rgba(150, 150, 150, 200);
+                        border-radius: 16px;
+                        font-size: 16px;
+                    }
+                    QPushButton:hover {
+                        background-color: rgba(220, 220, 220, 220);
+                        border: 1px solid rgba(100, 100, 100, 220);
+                    }
+                """)
+    
+    def update_theme_button_position(self):
+        """Update the theme toggle button position to bottom right"""
+        if hasattr(self, 'theme_toggle_btn'):
+            # Position in bottom right with small margin
+            margin = 10
+            btn_size = 32
+            x = self.width() - btn_size - margin
+            y = self.height() - btn_size - margin - 50  # Account for menu bar/toolbar
+            self.theme_toggle_btn.move(x, y)
+            self.theme_toggle_btn.raise_()  # Bring to front
     
     def update_scan_path_display(self):
         """Update the scan path label"""
@@ -1207,10 +1571,6 @@ class ScannerRouterGUI(QMainWindow):
             # Show prominent message in log
             self.log_message(f"📤 Starting upload: {scan_name}", "SUCCESS")
             self.log_message(f"   Destination: {dest}", "INFO")
-            # Update progress UI
-            self.current_upload_label.setText(f"Uploading: {scan_name}")
-            self.progress_bar.setValue(0)
-            self.progress_status_label.setText("Initializing...")
             # Extract order number from current order or dest path
             order_no = None
             with router.order_lock:
@@ -1222,6 +1582,18 @@ class ScannerRouterGUI(QMainWindow):
                         order_no = order.get("order_no", "")
                         if order_no and order_no.startswith("#"):
                             order_no = order_no[1:]
+            
+            # Update progress UI with order number
+            if order_no:
+                if order_no == "STAGING":
+                    self.current_upload_label.setText(f"Uploading: {scan_name} to STAGING")
+                else:
+                    self.current_upload_label.setText(f"Uploading: {scan_name} to Order #{order_no}")
+            else:
+                self.current_upload_label.setText(f"Uploading: {scan_name}")
+            
+            self.progress_bar.setValue(0)
+            self.progress_status_label.setText("Initializing...")
             self.update_scan_status(scan_name, "Uploading", 0, order_no)
         except Exception as e:
             error_trace = traceback.format_exc()
