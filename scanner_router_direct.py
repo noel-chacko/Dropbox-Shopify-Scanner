@@ -307,6 +307,8 @@ def shopify_search_orders(q: str) -> List[Dict[str, Any]]:
                             id
                             email
                             displayName
+                            firstName
+                            lastName
                             metafield(namespace:\"{CUSTOMER_LINK_FIELD_NS}\", key:\"{CUSTOMER_LINK_FIELD_KEY}\"){{ value }}
                         }}
                     }}
@@ -394,6 +396,47 @@ def order_update_note(order_gid: str, note: str, append: bool = True) -> bool:
         print(f"⚠️  Error updating order note: {e}")
         return False
 
+def get_existing_twin_checks_from_dropbox(order_path: str) -> List[str]:
+    """Get list of existing twin check folder names from Dropbox for an order.
+    Returns empty list if path doesn't exist or on error."""
+    if not order_path:
+        return []
+    
+    twin_checks = []
+    try:
+        refresh_dbx_if_needed()
+        # List folders under the order path
+        result = DBX.files_list_folder(order_path)
+        
+        # Extract folder names (twin check numbers)
+        entries = result.entries
+        for entry in entries:
+            if isinstance(entry, dropbox.files.FolderMetadata):
+                # Folder name is the twin check number
+                twin_checks.append(entry.name)
+        
+        # Handle pagination if there are more entries
+        while result.has_more:
+            result = DBX.files_list_folder_continue(result.cursor)
+            entries = result.entries
+            for entry in entries:
+                if isinstance(entry, dropbox.files.FolderMetadata):
+                    twin_checks.append(entry.name)
+        
+    except ApiError as e:
+        # Folder might not exist yet or other API error - that's okay
+        # Just return empty list - no existing twin checks
+        error_msg = str(e).lower()
+        if "not_found" not in error_msg and "not found" not in error_msg:
+            # Only log if it's not a simple "not found" error
+            print(f"⚠️  Could not list existing twin checks from Dropbox: {e}")
+    except Exception as e:
+        # Any other error - log but don't fail
+        print(f"⚠️  Error getting existing twin checks from Dropbox: {e}")
+    
+    return twin_checks
+
+
 def order_add_tags(order_gid: str, tags: List[str]) -> bool:
     """Add tags to an order using Shopify GraphQL. Also appends twin check numbers to order notes."""
     if not tags:
@@ -430,10 +473,21 @@ def order_add_tags(order_gid: str, tags: List[str]) -> bool:
     with order_lock:
         order = current_order_data
         if order and isinstance(order, dict) and order.get("order_gid") == order_gid:
-            twin_checks = order.get("twin_checks", [])
-            if twin_checks:
+            # Get existing twin checks from current session
+            current_twin_checks = order.get("twin_checks", [])
+            
+            # Get existing twin checks from Dropbox for this order
+            order_path = order.get("dropbox_order_path")
+            existing_twin_checks = []
+            if order_path:
+                existing_twin_checks = get_existing_twin_checks_from_dropbox(order_path)
+            
+            # Combine both lists and remove duplicates
+            all_twin_checks = list(set(current_twin_checks + existing_twin_checks))
+            
+            if all_twin_checks:
                 # Sort and format twin checks
-                twin_checks_sorted = sorted(set(twin_checks))  # Remove duplicates and sort
+                twin_checks_sorted = sorted(all_twin_checks)
                 twin_checks_str = ", ".join(twin_checks_sorted)
                 note_text = f"Twin Checks: {twin_checks_str}"
                 
@@ -1106,6 +1160,16 @@ def process_scan(scan_dir: Path) -> None:
     if gui_callbacks['scan_detected']:
         gui_callbacks['scan_detected'](scan_name, order)
     
+    # Extract order number from the order dict (captured at upload start time)
+    # This ensures we use the order that was active when upload started, not when it completed
+    order_no = None
+    if order.get("mode") == "stage":
+        order_no = "STAGING"
+    else:
+        order_no = order.get("order_no", "")
+        if order_no and order_no.startswith("#"):
+            order_no = order_no[1:]
+    
     # Upload based on order
     dest = None  # Initialize dest for error handling
     progress_cb = None  # Initialize progress_cb for error handling
@@ -1125,9 +1189,9 @@ def process_scan(scan_dir: Path) -> None:
             dest = f"{order_path}/{scan_name}"
             print(f"\n📤 Uploading {scan_name} to order #{order['order_no']}...")
         
-        # Notify GUI that upload is starting
+        # Notify GUI that upload is starting (pass order_no from the order used for upload)
         if gui_callbacks['upload_started']:
-            gui_callbacks['upload_started'](scan_name, dest)
+            gui_callbacks['upload_started'](scan_name, dest, order_no)
         
         # Create progress callback if GUI is active
         if gui_callbacks['upload_progress']:
@@ -1150,9 +1214,9 @@ def process_scan(scan_dir: Path) -> None:
         
         print(f"✅ Uploaded {uploaded} files")
         
-        # Notify GUI that upload is complete
+        # Notify GUI that upload is complete (pass order_no from the order used for upload)
         if gui_callbacks['upload_completed']:
-            gui_callbacks['upload_completed'](scan_name, uploaded, dest)
+            gui_callbacks['upload_completed'](scan_name, uploaded, dest, order_no)
         else:
             print(f"[DEBUG] upload_completed callback is None!")
         

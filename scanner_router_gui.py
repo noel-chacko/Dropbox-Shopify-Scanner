@@ -52,9 +52,9 @@ class ScannerWorker(QThread):
     error_occurred = Signal(str, str)
     path_changed = Signal(str)  # Emit when path changes
     # Signals for router callbacks
-    upload_started_signal = Signal(str, str)  # scan_name, dest
+    upload_started_signal = Signal(str, str, str)  # scan_name, dest, order_no
     upload_progress_signal = Signal(str, int, int, str)  # scan_name, current, total, message
-    upload_completed_signal = Signal(str, int, str)  # scan_name, file_count, dest
+    upload_completed_signal = Signal(str, int, str, str)  # scan_name, file_count, dest, order_no
     scan_detected_signal = Signal(str, dict)  # scan_name, order
     
     def __init__(self):
@@ -228,7 +228,7 @@ class ScannerRouterGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Scanner Router - Direct")
-        self.setGeometry(100, 100, 1080, 720)  # 10% smaller than original (1200x800)
+        self.setGeometry(100, 100, 1080, 480)  # Compact window height
         
         # Theme state (False = light, True = terminal)
         self.dark_mode = False
@@ -929,9 +929,9 @@ class ScannerRouterGUI(QMainWindow):
         """Setup callbacks for the router module - use signals for thread safety"""
         # Use worker signals for upload-related callbacks (thread-safe)
         router.gui_callbacks['scan_detected'] = lambda name, order: self.worker.scan_detected_signal.emit(name, order)
-        router.gui_callbacks['upload_started'] = lambda name, dest: self.worker.upload_started_signal.emit(name, dest)
+        router.gui_callbacks['upload_started'] = lambda name, dest, order_no: self.worker.upload_started_signal.emit(name, dest, order_no)
         router.gui_callbacks['upload_progress'] = lambda name, curr, total, msg: self.worker.upload_progress_signal.emit(name, curr, total, msg)
-        router.gui_callbacks['upload_completed'] = lambda name, count, dest: self.worker.upload_completed_signal.emit(name, count, dest)
+        router.gui_callbacks['upload_completed'] = lambda name, count, dest, order_no: self.worker.upload_completed_signal.emit(name, count, dest, order_no)
         
         # For other callbacks, use QTimer for thread safety
         def safe_callback(callback_func):
@@ -1155,32 +1155,6 @@ class ScannerRouterGUI(QMainWindow):
         controls_group.setLayout(controls_layout)
         layout.addWidget(controls_group)
         
-        # Scanner Path Group
-        path_group = QGroupBox("Scanner Path")
-        path_layout = QVBoxLayout()
-        
-        self.scan_path_label = QLabel("")
-        self.scan_path_label.setFont(QFont("Arial", 9))
-        self.scan_path_label.setWordWrap(True)
-        self.scan_path_label.setStyleSheet("color: #000000;")
-        path_layout.addWidget(self.scan_path_label)
-        
-        # Buttons layout for date controls
-        date_buttons_layout = QHBoxLayout()
-        
-        create_folder_btn = QPushButton("Create Date Folder")
-        create_folder_btn.clicked.connect(self.create_date_folder)
-        date_buttons_layout.addWidget(create_folder_btn)
-        
-        change_path_btn = QPushButton("Change Folder")
-        change_path_btn.clicked.connect(self.change_scan_folder)
-        date_buttons_layout.addWidget(change_path_btn)
-        
-        path_layout.addLayout(date_buttons_layout)
-        
-        path_group.setLayout(path_layout)
-        layout.addWidget(path_group)
-        
         # Recent Scans Group
         scans_group = QGroupBox("Recent Scans")
         scans_layout = QVBoxLayout()
@@ -1239,7 +1213,7 @@ class ScannerRouterGUI(QMainWindow):
         font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
         font.setPointSize(8)
         self.log_text.setFont(font)
-        self.log_text.setMaximumHeight(200)  # Limit log height
+        self.log_text.setMaximumHeight(150)  # Limit log height for compact window
         log_layout.addWidget(self.log_text)
         
         clear_btn = QPushButton("Clear Log")
@@ -1248,6 +1222,32 @@ class ScannerRouterGUI(QMainWindow):
         
         log_group.setLayout(log_layout)
         layout.addWidget(log_group)
+        
+        # Scanner Path Group (moved from left panel)
+        path_group = QGroupBox("Scanner Path")
+        path_layout = QVBoxLayout()
+        
+        self.scan_path_label = QLabel("")
+        self.scan_path_label.setFont(QFont("Arial", 9))
+        self.scan_path_label.setWordWrap(True)
+        self.scan_path_label.setStyleSheet("color: #000000;")
+        path_layout.addWidget(self.scan_path_label)
+        
+        # Buttons layout for path controls
+        path_buttons_layout = QHBoxLayout()
+        
+        create_folder_btn = QPushButton("Create Date Folder")
+        create_folder_btn.clicked.connect(self.create_date_folder)
+        path_buttons_layout.addWidget(create_folder_btn)
+        
+        change_path_btn = QPushButton("Change Folder")
+        change_path_btn.clicked.connect(self.change_scan_folder)
+        path_buttons_layout.addWidget(change_path_btn)
+        
+        path_layout.addLayout(path_buttons_layout)
+        
+        path_group.setLayout(path_layout)
+        layout.addWidget(path_group)
         
         return panel
     
@@ -1305,14 +1305,18 @@ class ScannerRouterGUI(QMainWindow):
             if order_node:
                 customer = order_node.get("customer")
                 if customer:
-                    first_name = customer.get("first_name", "")
-                    last_name = customer.get("last_name", "")
+                    # Try firstName/lastName first (Shopify GraphQL fields use camelCase)
+                    first_name = customer.get("firstName") or customer.get("first_name", "")
+                    last_name = customer.get("lastName") or customer.get("last_name", "")
                     if first_name or last_name:
                         customer_name = f"{first_name} {last_name}".strip()
+                    # Fallback to displayName if no first/last name
+                    if not customer_name and customer.get("displayName"):
+                        customer_name = customer.get("displayName")
             
             self.order_number_label.setText(f"Order #{order_no}")
             if customer_name:
-                self.order_email_label.setText(f"{customer_name}\n{email}")
+                self.order_email_label.setText(f"{email}\n{customer_name}")
             else:
                 self.order_email_label.setText(email)
             
@@ -1565,23 +1569,23 @@ class ScannerRouterGUI(QMainWindow):
             log_error_to_file("on_scan_detected", error_trace)
             self.log_message(f"Error in scan detection: {str(e)}", "ERROR")
     
-    def on_upload_started(self, scan_name: str, dest: str):
+    def on_upload_started(self, scan_name: str, dest: str, order_no: str = None):
         """Callback when upload starts"""
         try:
             # Show prominent message in log
             self.log_message(f"📤 Starting upload: {scan_name}", "SUCCESS")
             self.log_message(f"   Destination: {dest}", "INFO")
-            # Extract order number from current order or dest path
-            order_no = None
-            with router.order_lock:
-                order = router.current_order_data
-                if order and isinstance(order, dict):
-                    if order.get("mode") == "stage":
-                        order_no = "STAGING"
-                    else:
-                        order_no = order.get("order_no", "")
-                        if order_no and order_no.startswith("#"):
-                            order_no = order_no[1:]
+            # Use passed order_no, fallback to current order if not provided
+            if order_no is None:
+                with router.order_lock:
+                    order = router.current_order_data
+                    if order and isinstance(order, dict):
+                        if order.get("mode") == "stage":
+                            order_no = "STAGING"
+                        else:
+                            order_no = order.get("order_no", "")
+                            if order_no and order_no.startswith("#"):
+                                order_no = order_no[1:]
             
             # Update progress UI with order number
             if order_no:
@@ -1623,7 +1627,7 @@ class ScannerRouterGUI(QMainWindow):
             log_error_to_file("on_upload_progress", error_trace)
             # Don't spam errors for progress updates
     
-    def on_upload_completed(self, scan_name: str, file_count: int, dest: str):
+    def on_upload_completed(self, scan_name: str, file_count: int, dest: str, order_no: str = None):
         """Callback when upload completes"""
         try:
             # Show prominent success message
@@ -1633,17 +1637,17 @@ class ScannerRouterGUI(QMainWindow):
             self.current_upload_label.setText("No active upload")
             self.progress_bar.setValue(100)
             self.progress_status_label.setText(f"Completed: {file_count} files uploaded")
-            # Extract order number from current order
-            order_no = None
-            with router.order_lock:
-                order = router.current_order_data
-                if order and isinstance(order, dict):
-                    if order.get("mode") == "stage":
-                        order_no = "STAGING"
-                    else:
-                        order_no = order.get("order_no", "")
-                        if order_no and order_no.startswith("#"):
-                            order_no = order_no[1:]
+            # Use passed order_no, fallback to current order if not provided
+            if order_no is None:
+                with router.order_lock:
+                    order = router.current_order_data
+                    if order and isinstance(order, dict):
+                        if order.get("mode") == "stage":
+                            order_no = "STAGING"
+                        else:
+                            order_no = order.get("order_no", "")
+                            if order_no and order_no.startswith("#"):
+                                order_no = order_no[1:]
             # Update scan table
             self.update_scan_status(scan_name, "Completed", file_count, order_no)
             # Reset progress bar after a delay
