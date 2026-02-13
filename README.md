@@ -1,89 +1,94 @@
-# Shopify + Dropbox Scanner Integration
+# Shopify + Dropbox Scanner — macOS installation & run guide
 
-Automatically routes Noritsu scans to customer Dropbox folders and manages Shopify orders.
+This repository routes Noritsu scanner output into customer Dropbox folders and updates Shopify orders with links. The steps below are tailored for macOS (Intel/M1/M2). Follow them to set up the project, get Dropbox tokens, run the app locally, and optionally build an executable.
+### Quick contract
+- Inputs: scanner folder tree (Noritsu), Shopify API credentials, Dropbox app credentials
+- Outputs: uploaded photos to Dropbox, Shopify customer metafield updated with Dropbox link
+- Success criteria: a scanned folder uploaded and linked to the correct Shopify order
+- Error modes: missing env vars, token permissions, wrong scanner path
 
-## What it does
+## 1) Prerequisites (macOS)
+- macOS 10.14+ recommended (Intel or Apple Silicon)
+- Homebrew (optional but recommended)
+- Python 3.10 or 3.11 (project tested on 3.10/3.11)
+- Git (to clone or update repo)
 
-1. **Watches** your scanner output for completed scans
-2. **Prompts** you to search and select the correct Shopify order  
-3. **Uploads** photos to the right customer folder automatically
-4. **Saves** customer Dropbox links to their Shopify profiles
-5. **Tags** orders to trigger your Shopify Flow
-
-## Folder Structure
-
-```
-/Store/orders/
-├── JeffS@gmail.com/
-│   └── 100/
-│       ├── 2323/photos/  (roll 1)
-│       └── 2324/photos/  (roll 2)
-└── _staging/  (for uncertain orders)
+Install Homebrew (if you don't have it):
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 ```
 
-## Quick Setup
+Install Python (if needed):
+```bash
+# Intel mac
+brew install python@3.11
+# Apple Silicon: brew will choose the right binary
+```
 
-1. **Install**:
-   ```bash
-   python -m venv venv
-   source venv/bin/activate
-   pip install -r requirements.txt
-   ```
+Confirm python points to the correct version:
+```bash
+python3 --version
+```
 
-2. **Configure**:
-   ```bash
-   cp env_template.txt .env
-   # Edit .env with your credentials
-   ```
+## 2) Clone repository (if not already)
 
-3. **Run**:
-   ```bash
-   python scanner_router.py
-   ```
+```bash
+git clone <your-repo-url>
+cd Dropbox+Shopify+Scanner
+```
 
-## Required Setup
+## 3) Create and activate a virtual environment
 
-### Shopify
-1. Create custom app in Shopify Admin
-2. Enable permissions: `read_orders`, `write_orders`, `read_customers`, `write_customers`
-3. Create customer metafield: `custom.dropbox_root_url` (URL type)
-4. Update your Flow to use: `{{ order.customer.metafields.custom.dropbox_root_url }}`
+Use a venv in the project root:
 
-### Dropbox  
-1. Create app at [developers.dropbox.com](https://developers.dropbox.com)
-2. Enable: `files.content.write`, `files.content.read`, `files.metadata.read`, `files.metadata.write`, `sharing.read`, `sharing.write`
-3. Generate access token for `/Store/orders` account
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
 
-### Scanner Computer
-1. Install Python
-2. Copy app files to scanner PC
-3. Configure `.env` file
+Notes:
+- `requirements.txt` contains the Python dependencies. If you add packages, pin them here.
 
-## How to Use
+## 4) Environment variables (.env)
 
-1. **Start**: `python scanner_router.py`
-2. **Scan film** - app watches for completed folders
-3. **When ready**, type search term:
-   - Email: `jeff@example.com`
-   - Order #: `100` 
-   - Name: `jeff`
-   - Defer: `stage`
-4. **Pick from matches** and the app handles the rest
+Copy the template and edit it:
+```bash
+cp env_template.txt .env
+open .env
+```
 
-### Staging
-- Type `stage` if unsure about an order
-- Later run: `python reassign_staged.py`
+Required important variables (common ones in this project):
+- SHOPIFY_STORE: your-shop-name (used to build admin URLs)
+- SHOPIFY_ACCESS_TOKEN: admin API token for your custom app
+- DROPBOX_APP_KEY / DROPBOX_APP_SECRET: for the web OAuth flow (if used)
+- DROPBOX_REFRESH_TOKEN or DROPBOX_ACCESS_TOKEN: may be required depending on workflow
+- NORITSU_ROOT: path the app watches for completed raw scans (e.g. `/Volumes/Noritsu/Store/orders`)
 
-## Files
+See `env_template.txt` for the full list. If you use the GUI or the simple token script, you may be able to provide a short-lived token directly.
 
-- `scanner_router.py` - Main app (watches scanner, uploads to Dropbox)
-- `reassign_staged.py` - Move staged orders to customers  
-- `env_template.txt` - Copy to `.env` and add your credentials
-- `requirements.txt` - Python dependencies
+## 7) Run the app (CLI)
 
-## Troubleshooting
+- `scanner_router_gui.py` — launches a GUI
 
-- **"Missing .env entries"** - Check all required variables are set
-- **"Noritsu root not found"** - Verify `NORITSU_ROOT` path is correct
-- **"Shopify GraphQL error"** - Check token permissions and store name
-- **"Could not save customer link"** - Verify customer metafield is configured
+Example (CLI):
+
+python3 scanner_router_gui.py
+
+## 10) Troubleshooting checklist
+
+- "Missing .env entries": ensure `.env` contains all required keys from `env_template.txt`.
+- "Noritsu root not found": ensure `NORITSU_ROOT` is correct and accessible. If the scanner writes to an external drive, mount it before starting the app.
+- Dropbox permission errors: re-check app scopes in Dropbox Developer console and ensure the token corresponds to the app/account.
+- Shopify GraphQL errors: check `SHOPIFY_ACCESS_TOKEN` scope and store name. Use Admin > Apps > Your app > API credentials to regenerate if needed.
+
+Logs: the main scripts print errors to the console. Run them from Terminal so you can copy error output for debugging.
+
+## 12) Where to look next in this repo
+
+- `env_template.txt` — the env variables you must fill
+- `DROPBOX_TOKEN_SETUP.md` and `get_dropbox_refresh_token.py` — token guidance
+- `scanner_router*.py` — main entry points
+- `reassign_staged.py` — staged reassignments
+- `requirements.txt` — Python deps
