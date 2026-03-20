@@ -743,25 +743,21 @@ def upload_folder(local_dir: Path, dropbox_path: str, progress_callback=None) ->
     """Upload a folder to Dropbox with rate limiting"""
     count = 0
     total_files = 0
-    # Delay between uploads to prevent rate limiting (in seconds)
-    # Very small delay for maximum speed - retry logic handles any rate limits
-    UPLOAD_DELAY = 0.05  # 50ms delay - very fast, retry logic handles rate limits if they occur
+    # Delay between uploads to reduce Dropbox write-request bursts
+    UPLOAD_DELAY = float(os.getenv('UPLOAD_DELAY', '0.2'))  # 200ms default; set UPLOAD_DELAY in .env to override
     
     try:
         # Refresh token once at the start for efficiency
         refresh_dbx_if_needed()
-        # Ensure target directory exists
+        # Ensure target directory exists (handles rate limiting and already-existing path)
         try:
-            DBX.files_create_folder_v2(dropbox_path)
-        except ApiError:
-            pass
-        except AuthError:
-            # Token expired - refresh and retry
-            refresh_dbx_if_needed()
-            try:
-                DBX.files_create_folder_v2(dropbox_path)
-            except ApiError:
-                pass
+            ensure_tree(dropbox_path)
+        except RateLimitError as e:
+            # Let outer logic handle rate limiting and retry
+            raise
+        except ApiError as e:
+            # Log folder creation issue, but continue with per-file retries.
+            log_dropbox_error("Upload Folder - Ensure Tree", e, f"Folder: {dropbox_path}")
 
         # Collect all files to upload
         files_to_upload = []
@@ -1333,7 +1329,7 @@ def main():
     root = Path(NORITSU_ROOT)
     if root.exists():
         existing_folders = {d.name for d in root.iterdir() if d.is_dir()}
-        print(f"Found {len(existing_folders)} existing folders - these will be ignored")
+        print(f"Found {len(existing_folders)} existing folders - unprocessed folders will still be checked")
     else:
         existing_folders = set()
         print("Warning: Cannot access watch directory for initial snapshot")
@@ -1376,11 +1372,15 @@ def main():
             for scan_dir in root.iterdir():
                 if not scan_dir.is_dir():
                     continue
-                
-                # Skip folders that existed when the program started
-                if scan_dir.name in existing_folders:
+
+                # Skip folders we've already processed successfully
+                if STATE.get(scan_dir.name):
                     continue
-                    
+
+                # Existing folders from startup are still considered if not processed
+                if scan_dir.name in existing_folders:
+                    print(f"ℹ️  Found pre-existing scan folder (unprocessed): {scan_dir.name}")
+
                 process_scan(scan_dir)
                 
         except Exception as e:
