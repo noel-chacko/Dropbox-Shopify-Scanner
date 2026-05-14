@@ -56,6 +56,9 @@ class ScannerWorker(QThread):
     upload_progress_signal = Signal(str, int, int, str)  # scan_name, current, total, message
     upload_completed_signal = Signal(str, int, str, str)  # scan_name, file_count, dest, order_no
     scan_detected_signal = Signal(str, dict)  # scan_name, order
+    status_signal = Signal(str)  # For status messages
+    error_signal = Signal(str, str)  # For error messages (scan_name, error_msg)
+    order_changed_signal = Signal(dict)  # For order changes
     
     def __init__(self):
         super().__init__()
@@ -266,6 +269,9 @@ class ScannerRouterGUI(QMainWindow):
         self.worker.upload_progress_signal.connect(self.on_upload_progress)
         self.worker.upload_completed_signal.connect(self.on_upload_completed)
         self.worker.scan_detected_signal.connect(self.on_scan_detected)
+        self.worker.status_signal.connect(self.on_status)
+        self.worker.error_signal.connect(self.on_error)
+        self.worker.order_changed_signal.connect(self.on_order_changed)
         self.worker.start()
         
         # Setup GUI callbacks (after worker is created)
@@ -933,26 +939,10 @@ class ScannerRouterGUI(QMainWindow):
         router.gui_callbacks['upload_progress'] = lambda name, curr, total, msg: self.worker.upload_progress_signal.emit(name, curr, total, msg)
         router.gui_callbacks['upload_completed'] = lambda name, count, dest, order_no: self.worker.upload_completed_signal.emit(name, count, dest, order_no)
         
-        # For other callbacks, use QTimer for thread safety
-        def safe_callback(callback_func):
-            """Wrap callback to ensure it runs on main thread"""
-            def wrapper(*args, **kwargs):
-                def safe_execute():
-                    try:
-                        callback_func(*args, **kwargs)
-                    except Exception as e:
-                        error_trace = traceback.format_exc()
-                        log_error_to_file(f"Callback Execution: {callback_func.__name__}", error_trace)
-                        try:
-                            self.log_message(f"Error in callback {callback_func.__name__}: {str(e)}", "ERROR")
-                        except:
-                            pass
-                QTimer.singleShot(0, safe_execute)
-            return wrapper
-        
-        router.gui_callbacks['order_changed'] = safe_callback(self.on_order_changed)
-        router.gui_callbacks['error'] = safe_callback(self.on_error)
-        router.gui_callbacks['status'] = safe_callback(self.on_status)
+        # Use signals for other callbacks (thread-safe)
+        router.gui_callbacks['order_changed'] = lambda order_data: self.worker.order_changed_signal.emit(order_data)
+        router.gui_callbacks['error'] = lambda scan_name, error_msg: self.worker.error_signal.emit(scan_name, error_msg)
+        router.gui_callbacks['status'] = lambda msg: self.worker.status_signal.emit(msg)
     
     def init_ui(self):
         """Initialize the UI"""
