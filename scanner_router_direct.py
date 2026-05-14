@@ -1175,7 +1175,17 @@ def process_scan(scan_dir: Path) -> None:
             dest = f"{DROPBOX_ROOT}/_staging/{scan_name}"
             print(f"\n📤 Uploading {scan_name} to staging...")
         else:
-            order_path = order.get("dropbox_order_path")
+            print(f"\n📤 Uploading {scan_name} to order #{order['order_no']}...")
+            # Wait up to 15s for background Dropbox folder setup thread to finish
+            order_path = None
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                with order_lock:
+                    order_path = current_order_data.get("dropbox_order_path") if current_order_data else None
+                if order_path:
+                    break
+                print(f"  ⏳ Waiting for Dropbox folder setup...")
+                time.sleep(1)
             if not order_path:
                 _, order_path = ensure_customer_order_folder(order["order_node"])
                 with order_lock:
@@ -1183,7 +1193,6 @@ def process_scan(scan_dir: Path) -> None:
                         current_order_data["dropbox_order_path"] = order_path
                 order["dropbox_order_path"] = order_path
             dest = f"{order_path}/{scan_name}"
-            print(f"\n📤 Uploading {scan_name} to order #{order['order_no']}...")
         
         # Notify GUI that upload is starting (pass order_no from the order used for upload)
         if gui_callbacks['upload_started']:

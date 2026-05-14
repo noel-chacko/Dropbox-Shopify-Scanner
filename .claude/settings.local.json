@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cat /Users/noelchacko/Dropbox+Shopify+Scanner/.processed_jobs.json 2>/dev/null || echo \"File not found\")"
+    ]
+  }
+}
