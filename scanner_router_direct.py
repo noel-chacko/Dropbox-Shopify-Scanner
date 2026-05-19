@@ -744,7 +744,7 @@ def upload_folder(local_dir: Path, dropbox_path: str, progress_callback=None) ->
     count = 0
     total_files = 0
     # Delay between uploads to reduce Dropbox write-request bursts
-    UPLOAD_DELAY = float(os.getenv('UPLOAD_DELAY', '0.2'))  # 200ms default; set UPLOAD_DELAY in .env to override
+    UPLOAD_DELAY = float(os.getenv('UPLOAD_DELAY', '0.5'))  # 500ms default; set UPLOAD_DELAY in .env to override
     
     try:
         # Refresh token once at the start for efficiency
@@ -799,12 +799,11 @@ def upload_folder(local_dir: Path, dropbox_path: str, progress_callback=None) ->
                     if progress_callback:
                         progress_callback(idx, total_files, error_msg)
                     log_dropbox_error("Upload File (Rate Limit)", e, f"File: {file_path}, Dropbox path: {dropbox_file}")
-                    # Wait longer for rate limits (15-30 seconds)
-                    wait_time = 15
-                    # Try to extract retry_after if available
+                    # Respect Dropbox's retry_after value — don't over-wait
+                    wait_time = 3  # fallback if retry_after is missing
                     if hasattr(rate_limit_err, 'retry_after') and rate_limit_err.retry_after is not None:
                         try:
-                            wait_time = max(wait_time, int(rate_limit_err.retry_after))
+                            wait_time = int(rate_limit_err.retry_after) + 2
                         except (ValueError, TypeError):
                             pass
                     print(f"   Waiting {wait_time} seconds before continuing...")
@@ -861,10 +860,10 @@ def upload_folder(local_dir: Path, dropbox_path: str, progress_callback=None) ->
                     if progress_callback:
                         progress_callback(len(files_to_upload), total_files, error_msg)
                     log_dropbox_error("Upload WPPC.jpg (Rate Limit)", e, f"Dropbox path: {wppc_dropbox_path}")
-                    wait_time = 15
+                    wait_time = 3  # fallback if retry_after is missing
                     if hasattr(rate_limit_err, 'retry_after') and rate_limit_err.retry_after is not None:
                         try:
-                            wait_time = max(wait_time, int(rate_limit_err.retry_after))
+                            wait_time = int(rate_limit_err.retry_after) + 2
                         except (ValueError, TypeError):
                             pass
                     print(f"   Waiting {wait_time} seconds before retrying WPPC.jpg...")
@@ -1146,8 +1145,12 @@ def process_scan(scan_dir: Path) -> None:
         order = current_order_data
         
     if not order:
-        print(f"\n⚠️ New scan detected: {scan_name}")
-        print("No current order set.")
+        print(f"\n⚠️ New scan detected: {scan_name} — no order set yet, will retry")
+        if gui_callbacks['status']:
+            gui_callbacks['status'](f"⚠️ Scan {scan_name} waiting — please enter an order number")
+        if any(gui_callbacks.values()):
+            # GUI mode: don't call interactive input(), just skip and let the scan loop retry
+            return
         set_order()
         with order_lock:
             order = current_order_data
@@ -1257,11 +1260,11 @@ def process_scan(scan_dir: Path) -> None:
         print(error_msg)
         print(f"   {detail_msg}")
         
-        # Determine wait time
-        wait_time = 30  # Default longer wait for rate limits
+        # Respect Dropbox's retry_after value — don't over-wait
+        wait_time = 3  # fallback if retry_after is missing
         if rate_limit_err and hasattr(rate_limit_err, 'retry_after') and rate_limit_err.retry_after is not None:
             try:
-                wait_time = max(wait_time, int(rate_limit_err.retry_after))
+                wait_time = int(rate_limit_err.retry_after) + 2
             except (ValueError, TypeError):
                 pass
         
