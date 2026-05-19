@@ -739,12 +739,13 @@ def _upload_single_file(file_path: Path, dropbox_file: str) -> bool:
         # Re-raise other ApiErrors to trigger retry
         raise
 
-def upload_folder(local_dir: Path, dropbox_path: str, progress_callback=None) -> int:
+def upload_folder(local_dir: Path, dropbox_path: str, progress_callback=None, upload_delay: float = None) -> int:
     """Upload a folder to Dropbox with rate limiting"""
     count = 0
     total_files = 0
     # Delay between uploads to reduce Dropbox write-request bursts
-    UPLOAD_DELAY = float(os.getenv('UPLOAD_DELAY', '0.5'))  # 500ms default; set UPLOAD_DELAY in .env to override
+    # Callers can pass upload_delay directly; otherwise falls back to env/default
+    UPLOAD_DELAY = upload_delay if upload_delay is not None else float(os.getenv('UPLOAD_DELAY', '0.5'))
     
     try:
         # Refresh token once at the start for efficiency
