@@ -65,6 +65,8 @@ class ScannerWorker(QThread):
         self.running = True
         self.current_root = None
         self.existing_folders = set()
+        self._in_progress = set()       # scan names currently being uploaded
+        self._in_progress_lock = threading.Lock()
         
     def update_path(self, new_path: str):
         """Update the scan path and reset existing folders"""
@@ -143,14 +145,29 @@ class ScannerWorker(QThread):
                     
                     # New folder detected - notify GUI
                     self.status_update.emit(f"🔍 Found new folder: {scan_dir.name} - checking files and settling...")
-                    
-                    # Process scan (this will trigger callbacks)
-                    router.process_scan(scan_dir)
-                    
-                    # After processing, check if it was successfully added to STATE
-                    # If so, add to existing_folders to prevent re-checking
-                    if router.STATE.get(scan_dir.name):
-                        self.existing_folders.add(scan_dir.name)
+
+                    # Skip if already being uploaded in a background thread
+                    with self._in_progress_lock:
+                        if scan_dir.name in self._in_progress:
+                            continue
+                        self._in_progress.add(scan_dir.name)
+
+                    # Run process_scan in a background thread so the scan loop
+                    # keeps detecting new folders while an upload is in progress
+                    def _run_scan(sd=scan_dir):
+                        try:
+                            router.process_scan(sd)
+                        finally:
+                            with self._in_progress_lock:
+                                self._in_progress.discard(sd.name)
+                            # If it was successfully processed, mark it so the
+                            # loop stops re-checking it
+                            if router.STATE.get(sd.name):
+                                self.existing_folders.add(sd.name)
+
+                    t = threading.Thread(target=_run_scan, daemon=True,
+                                         name=f"Upload-{scan_dir.name}")
+                    t.start()
                     
             except Exception as e:
                 self.error_occurred.emit("Scanner Loop", str(e))
