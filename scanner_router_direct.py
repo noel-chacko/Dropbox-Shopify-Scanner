@@ -739,7 +739,7 @@ def _upload_single_file(file_path: Path, dropbox_file: str) -> bool:
         # Re-raise other ApiErrors to trigger retry
         raise
 
-def upload_folder(local_dir: Path, dropbox_path: str, progress_callback=None, upload_delay: float = None) -> int:
+def upload_folder(local_dir: Path, dropbox_path: str, progress_callback=None, upload_delay: float = None, exclude_files: set = None) -> int:
     """Upload a folder to Dropbox with rate limiting"""
     count = 0
     total_files = 0
@@ -761,9 +761,12 @@ def upload_folder(local_dir: Path, dropbox_path: str, progress_callback=None, up
             log_dropbox_error("Upload Folder - Ensure Tree", e, f"Folder: {dropbox_path}")
 
         # Collect all files to upload
+        _excluded = {n.lower() for n in (exclude_files or [])}
         files_to_upload = []
         for file_path in local_dir.rglob("*"):
             if not file_path.is_file():
+                continue
+            if file_path.name.lower() in _excluded:
                 continue
             rel_path = file_path.relative_to(local_dir)
             dropbox_file = f"{dropbox_path}/{rel_path}"

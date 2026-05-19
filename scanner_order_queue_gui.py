@@ -252,7 +252,7 @@ class UploadOrderWorker(QThread):
                     return cb
 
                 try:
-                    uploaded = router.upload_folder(scan_dir, dest, _make_cb(scan_name), upload_delay=2.0)
+                    uploaded = router.upload_folder(scan_dir, dest, _make_cb(scan_name), upload_delay=2.0, exclude_files={"thumbs.db"})
                     total_uploaded += uploaded
                     self.scan_upload_progress.emit(
                         self.order_input, scan_name, uploaded, uploaded,
@@ -285,7 +285,8 @@ class OrderGroupWidget(QFrame):
     move_down_requested = Signal(str, str)     # order_input, scan_name
     retry_requested = Signal(str)              # order_input
 
-    def __init__(self, batch: OrderBatch, is_active: bool, has_prev: bool, has_next: bool, parent=None):
+    def __init__(self, batch: OrderBatch, is_active: bool,
+                 has_prev: bool, has_next: bool, parent=None):
         super().__init__(parent)
         self.batch = batch
         # Keyed by scan_name — updated in-place by update_scan_progress()
@@ -621,7 +622,6 @@ class ScannerOrderQueueGUI(QMainWindow):
             is_active = (batch.order_input == self._active_order_input)
             has_prev = (i > 0)
             has_next = (i < last_idx)
-
             card = OrderGroupWidget(batch, is_active=is_active, has_prev=has_prev, has_next=has_next)
             card.confirm_requested.connect(self._on_confirm_order)
             card.move_up_requested.connect(self._on_move_up)
