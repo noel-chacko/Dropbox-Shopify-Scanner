@@ -281,17 +281,18 @@ class OrderGroupWidget(QFrame):
     """
 
     confirm_requested = Signal(str)            # order_input
+    move_up_requested = Signal(str, str)       # order_input, scan_name
     move_down_requested = Signal(str, str)     # order_input, scan_name
     retry_requested = Signal(str)              # order_input
 
-    def __init__(self, batch: OrderBatch, is_active: bool, has_next: bool, parent=None):
+    def __init__(self, batch: OrderBatch, is_active: bool, has_prev: bool, has_next: bool, parent=None):
         super().__init__(parent)
         self.batch = batch
         # Keyed by scan_name — updated in-place by update_scan_progress()
         self._progress_labels: Dict[str, QLabel] = {}
-        self._build(is_active, has_next)
+        self._build(is_active, has_prev, has_next)
 
-    def _build(self, is_active: bool, has_next: bool):
+    def _build(self, is_active: bool, has_prev: bool, has_next: bool):
         self.setFrameShape(QFrame.StyledPanel)
         self.setLineWidth(2)
 
@@ -351,7 +352,8 @@ class OrderGroupWidget(QFrame):
         root.addWidget(sep)
 
         # --- Twin check rows ---
-        can_move = has_next and self.batch.status == "pending"
+        can_move_up = has_prev and self.batch.status == "pending"
+        can_move_down = has_next and self.batch.status == "pending"
         if self.batch.twin_checks:
             for scan_name in self.batch.twin_checks:
                 row = QHBoxLayout()
@@ -367,16 +369,25 @@ class OrderGroupWidget(QFrame):
                 self._progress_labels[scan_name] = prog_lbl
                 row.addWidget(prog_lbl)
 
-                # Move Down button — enabled for any pending group that has a group below it
-                # (including Unassigned so scans can be moved into real orders)
-                move_btn = QPushButton("Move Down ↓")
-                move_btn.setFixedHeight(26)
-                move_btn.setFont(QFont("Arial", 9))
-                move_btn.setEnabled(can_move)
-                move_btn.clicked.connect(
+                up_btn = QPushButton("↑")
+                up_btn.setFixedSize(28, 26)
+                up_btn.setFont(QFont("Arial", 9))
+                up_btn.setEnabled(can_move_up)
+                up_btn.setToolTip("Move to previous order")
+                up_btn.clicked.connect(
+                    (lambda sn: lambda: self.move_up_requested.emit(self.batch.order_input, sn))(scan_name)
+                )
+                row.addWidget(up_btn)
+
+                down_btn = QPushButton("↓")
+                down_btn.setFixedSize(28, 26)
+                down_btn.setFont(QFont("Arial", 9))
+                down_btn.setEnabled(can_move_down)
+                down_btn.setToolTip("Move to next order")
+                down_btn.clicked.connect(
                     (lambda sn: lambda: self.move_down_requested.emit(self.batch.order_input, sn))(scan_name)
                 )
-                row.addWidget(move_btn)
+                row.addWidget(down_btn)
 
                 root.addLayout(row)
         else:
@@ -608,10 +619,12 @@ class ScannerOrderQueueGUI(QMainWindow):
         last_idx = len(self.order_queue) - 1
         for i, batch in enumerate(self.order_queue):
             is_active = (batch.order_input == self._active_order_input)
+            has_prev = (i > 0)
             has_next = (i < last_idx)
 
-            card = OrderGroupWidget(batch, is_active=is_active, has_next=has_next)
+            card = OrderGroupWidget(batch, is_active=is_active, has_prev=has_prev, has_next=has_next)
             card.confirm_requested.connect(self._on_confirm_order)
+            card.move_up_requested.connect(self._on_move_up)
             card.move_down_requested.connect(self._on_move_down)
             card.retry_requested.connect(self._on_retry_order)
             self._order_cards[batch.order_input] = card
@@ -699,6 +712,23 @@ class ScannerOrderQueueGUI(QMainWindow):
     # ------------------------------------------------------------------
     # Slot: move twin check down to next order
     # ------------------------------------------------------------------
+
+    def _on_move_up(self, order_input: str, scan_name: str):
+        src_idx = self._find_batch_index(order_input)
+        if src_idx is None or src_idx == 0:
+            return
+        dst_idx = src_idx - 1
+
+        src = self.order_queue[src_idx]
+        dst = self.order_queue[dst_idx]
+
+        if scan_name in src.twin_checks:
+            src.twin_checks.remove(scan_name)
+        if scan_name not in dst.twin_checks:
+            dst.twin_checks.append(scan_name)
+
+        self._log(f"Moved {scan_name}: {src.display_name} → {dst.display_name}", "INFO")
+        self._rebuild_right_panel()
 
     def _on_move_down(self, order_input: str, scan_name: str):
         src_idx = self._find_batch_index(order_input)
