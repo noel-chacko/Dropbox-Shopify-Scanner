@@ -20,16 +20,72 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QTextEdit, QProgressBar,
     QGroupBox, QMessageBox, QSplitter, QScrollArea, QFrame,
-    QFileDialog, QDialog, QDialogButtonBox, QDateEdit,
+    QFileDialog, QDialog, QDialogButtonBox, QDateEdit, QSizePolicy,
 )
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QDate
-from PySide6.QtGui import QFont, QFontDatabase
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QDate, QPoint, QMimeData
+from PySide6.QtGui import QFont, QFontDatabase, QPainter, QBrush, QColor, QRegion, QPolygon, QDrag
 
 import scanner_router_direct as router
 
-SETTLE_SECONDS = router.SETTLE_SECONDS
+SETTLE_SECONDS = float(os.getenv("SETTLE_SECONDS", "0.7"))
 SCAN_INTERVAL = router.SCAN_INTERVAL
 UNASSIGNED = "__UNASSIGNED__"
+
+
+# ---------------------------------------------------------------------------
+# Decorative stripe bar (matches the Noritsu scanner tape)
+# ---------------------------------------------------------------------------
+
+class StripeWidget(QWidget):
+    """
+    Diagonal stripe bar shaped like a parallelogram — left edge vertical,
+    right edge cut at 45° matching the stripe angle, like the tape on the scanner.
+    """
+
+    # (horizontal width in px, color — None means maroon background, just skip)
+    _PATTERN = [
+        (20, None),
+        (9,  QColor(211, 211, 211)),   # grey (matches background)
+        (5,  None),
+        (9,  QColor(168, 138, 210)),   # lavender
+    ]
+    _BG = QColor(108, 4, 22)           # dark maroon
+
+    def __init__(self, height: int = 22, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(height)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Clip the widget to a parallelogram — narrow at top, wider at bottom (\-slant)
+        w, h = self.width(), self.height()
+        self.setMask(QRegion(QPolygon([
+            QPoint(0,     0),
+            QPoint(w - h, 0),
+            QPoint(w,     h),
+            QPoint(0,     h),
+        ])))
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        w, h = self.width(), self.height()
+
+        painter.fillRect(self.rect(), self._BG)
+        painter.setPen(Qt.NoPen)
+
+        x = -h  # start left enough that stripes cover the bottom-left corner
+        while x < w + h:
+            for stripe_w, color in self._PATTERN:
+                if color is not None:
+                    painter.setBrush(QBrush(color))
+                    painter.drawPolygon([
+                        QPoint(x,                0),
+                        QPoint(x + stripe_w,     0),
+                        QPoint(x + stripe_w + h, h),
+                        QPoint(x + h,            h),
+                    ])
+                x += stripe_w
 
 
 # ---------------------------------------------------------------------------
@@ -48,6 +104,7 @@ class OrderBatch:
         # Populated at confirm time
         self.order_no: Optional[str] = None          # e.g. "1232323"
         self.email: Optional[str] = None
+        self.customer_name: Optional[str] = None
         # Per-scan upload progress: {scan_name: (current, total, msg)}
         self.progress: Dict[str, tuple] = {}
 
@@ -67,7 +124,8 @@ class OrderBatch:
 class ScanQueueWorker(QThread):
     """Polls the scanner root, waits for folders to settle, then emits scan_settled."""
 
-    scan_settled = Signal(str)    # scan_name
+    scan_settled = Signal(str)              # scan_name
+    settling_update = Signal(str, int, float)  # scan_name, file_count, size_mb
     status_update = Signal(str)
     path_changed = Signal(str)
 
@@ -103,6 +161,19 @@ class ScanQueueWorker(QThread):
         if self.current_root.exists():
             self.existing_folders = {d.name for d in self.current_root.iterdir() if d.is_dir()}
         self.path_changed.emit(new_path)
+
+    @staticmethod
+    def _folder_stats(scan_dir: Path):
+        """Return (file_count, size_mb, latest_mtime) for a scan folder."""
+        try:
+            files = [f for f in scan_dir.rglob("*") if f.is_file()]
+            if not files:
+                return 0, 0.0, 0.0
+            size = sum(f.stat().st_size for f in files)
+            mtime = max(f.stat().st_mtime for f in files)
+            return len(files), size / 1_048_576, mtime
+        except Exception:
+            return 0, 0.0, 0.0
 
     @staticmethod
     def _is_settled(scan_dir: Path) -> bool:
@@ -167,7 +238,7 @@ class ScanQueueWorker(QThread):
                         self.pending_settles[name] = time.time()
                         self.status_update.emit(f"🔍 New scan: {name} — waiting to settle…")
 
-                # Check pending settles
+                # Check pending settles — emit live stats each loop
                 for name in list(self.pending_settles.keys()):
                     with self._lock:
                         already = name in self.processed
@@ -178,6 +249,8 @@ class ScanQueueWorker(QThread):
                     if not scan_dir.exists():
                         del self.pending_settles[name]
                         continue
+                    count, size_mb, _ = self._folder_stats(scan_dir)
+                    self.settling_update.emit(name, count, size_mb)
                     if self._is_settled(scan_dir):
                         self.scan_settled.emit(name)
                         del self.pending_settles[name]
@@ -198,7 +271,7 @@ class ScanQueueWorker(QThread):
 class UploadOrderWorker(QThread):
     """Looks up an order in Shopify and uploads all its twin check folders."""
 
-    order_resolved = Signal(str, str, str)           # order_input, order_no, email
+    order_resolved = Signal(str, str, str, str)      # order_input, order_no, email, customer_name
     scan_upload_started = Signal(str, str, str)      # order_input, scan_name, dest
     scan_upload_progress = Signal(str, str, int, int, str)  # order_input, scan_name, curr, total, msg
     upload_completed = Signal(str, int)              # order_input, total_files
@@ -227,7 +300,11 @@ class UploadOrderWorker(QThread):
             order_no = (order_node.get("name") or "").lstrip("#")
             customer = order_node.get("customer") or {}
             email = (customer.get("email") or order_node.get("email") or "unknown").strip().lower()
-            self.order_resolved.emit(self.order_input, order_no, email)
+            first = customer.get("firstName") or customer.get("first_name") or ""
+            last  = customer.get("lastName")  or customer.get("last_name")  or ""
+            customer_name = (f"{first} {last}".strip()
+                             or customer.get("displayName") or "")
+            self.order_resolved.emit(self.order_input, order_no, email, customer_name)
 
             # --- Dropbox folder ---
             _, order_path = router.ensure_customer_order_folder(order_node)
@@ -270,6 +347,49 @@ class UploadOrderWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
+# Draggable scan-name label (for drag-and-drop between order groups)
+# ---------------------------------------------------------------------------
+
+class DraggableScanLabel(QLabel):
+    """QLabel that initiates a drag carrying its order_input + scan_name."""
+
+    MIME_TYPE = "application/x-scancheck"
+    _DRAG_THRESHOLD = 8  # Manhattan distance before drag starts
+
+    def __init__(self, scan_name: str, order_input: str, parent=None):
+        super().__init__(scan_name, parent)
+        self.scan_name = scan_name
+        self.order_input = order_input
+        self.setFont(QFont("Courier", 11))
+        self.setCursor(Qt.OpenHandCursor)
+        self._press_pos = None
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._press_pos = event.position().toPoint()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if not (event.buttons() & Qt.LeftButton) or self._press_pos is None:
+            return
+        if (event.position().toPoint() - self._press_pos).manhattanLength() < self._DRAG_THRESHOLD:
+            return
+        drag = QDrag(self)
+        mime = QMimeData()
+        mime.setData(self.MIME_TYPE,
+                     f"{self.order_input}\n{self.scan_name}".encode())
+        drag.setMimeData(mime)
+        drag.setPixmap(self.grab())
+        drag.setHotSpot(event.position().toPoint())
+        self._press_pos = None
+        drag.exec(Qt.MoveAction)
+
+    def mouseReleaseEvent(self, event):
+        self._press_pos = None
+        super().mouseReleaseEvent(event)
+
+
+# ---------------------------------------------------------------------------
 # Order group widget (right panel card)
 # ---------------------------------------------------------------------------
 
@@ -284,6 +404,7 @@ class OrderGroupWidget(QFrame):
     move_up_requested = Signal(str, str)       # order_input, scan_name
     move_down_requested = Signal(str, str)     # order_input, scan_name
     retry_requested = Signal(str)              # order_input
+    drop_scan_requested = Signal(str, str, str)  # src_order_input, scan_name, dst_order_input
 
     def __init__(self, batch: OrderBatch, is_active: bool,
                  has_prev: bool, has_next: bool, parent=None):
@@ -292,10 +413,11 @@ class OrderGroupWidget(QFrame):
         # Keyed by scan_name — updated in-place by update_scan_progress()
         self._progress_labels: Dict[str, QLabel] = {}
         self._build(is_active, has_prev, has_next)
+        self.setAcceptDrops(True)
 
     def _build(self, is_active: bool, has_prev: bool, has_next: bool):
-        self.setFrameShape(QFrame.StyledPanel)
-        self.setLineWidth(2)
+        self.setFrameShape(QFrame.Box)
+        self.setLineWidth(1)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 6, 8, 6)
@@ -305,42 +427,30 @@ class OrderGroupWidget(QFrame):
         header_row = QHBoxLayout()
         count = len(self.batch.twin_checks)
         count_str = f"  ({count} scan{'s' if count != 1 else ''})" if count else ""
-        title = QLabel(self.batch.display_name + count_str)
+        active_str = "  [ACTIVE]" if (is_active and self.batch.status == "pending") else ""
+        title = QLabel(self.batch.display_name + count_str + active_str)
         title.setFont(QFont("Arial", 12, QFont.Bold))
         header_row.addWidget(title)
 
-        if is_active and self.batch.status == "pending":
-            active_badge = QLabel("ACTIVE")
-            active_badge.setStyleSheet(
-                "color: white; background-color: #0066cc; "
-                "padding: 2px 6px; border-radius: 3px; font-size: 9pt; font-weight: bold;"
-            )
-            header_row.addWidget(active_badge)
-
-        status_badge = QLabel(self.batch.status.upper())
-        status_colors = {
-            "pending":   ("black",  "#e0e0e0"),
-            "uploading": ("white",  "#e6a817"),
-            "completed": ("white",  "#2e7d32"),
-            "error":     ("white",  "#c62828"),
-        }
-        fg, bg = status_colors.get(self.batch.status, ("black", "#e0e0e0"))
-        status_badge.setStyleSheet(
-            f"color: {fg}; background-color: {bg}; "
-            "padding: 2px 6px; border-radius: 3px; font-size: 9pt; font-weight: bold;"
-        )
-        header_row.addWidget(status_badge)
+        status_lbl = QLabel(f"[{self.batch.status.upper()}]")
+        status_lbl.setFont(QFont("Arial", 9))
+        header_row.addWidget(status_lbl)
         header_row.addStretch()
         root.addLayout(header_row)
 
-        if self.batch.email:
-            email_lbl = QLabel(self.batch.email)
-            email_lbl.setStyleSheet("color: #555; font-size: 9pt;")
-            root.addWidget(email_lbl)
+        if self.batch.email or self.batch.customer_name:
+            parts = []
+            if self.batch.customer_name:
+                parts.append(self.batch.customer_name)
+            if self.batch.email:
+                parts.append(self.batch.email)
+            info_lbl = QLabel("  |  ".join(parts))
+            info_lbl.setFont(QFont("Arial", 9))
+            root.addWidget(info_lbl)
 
         if self.batch.error_msg:
-            err_lbl = QLabel(self.batch.error_msg)
-            err_lbl.setStyleSheet("color: #c62828; font-size: 9pt;")
+            err_lbl = QLabel(f"Error: {self.batch.error_msg}")
+            err_lbl.setFont(QFont("Arial", 9))
             err_lbl.setWordWrap(True)
             if self.batch.error_detail:
                 err_lbl.setToolTip(self.batch.error_detail)
@@ -349,7 +459,7 @@ class OrderGroupWidget(QFrame):
         # --- Separator ---
         sep = QFrame()
         sep.setFrameShape(QFrame.HLine)
-        sep.setStyleSheet("color: #ccc;")
+        sep.setStyleSheet("")
         root.addWidget(sep)
 
         # --- Twin check rows ---
@@ -359,14 +469,13 @@ class OrderGroupWidget(QFrame):
             for scan_name in self.batch.twin_checks:
                 row = QHBoxLayout()
 
-                name_lbl = QLabel(scan_name)
-                name_lbl.setFont(QFont("Courier", 11))
+                name_lbl = DraggableScanLabel(scan_name, self.batch.order_input)
                 row.addWidget(name_lbl, stretch=1)
 
                 # Progress label — always created so update_scan_progress() can find it
                 prog = self.batch.progress.get(scan_name)
                 prog_lbl = QLabel(prog[2] if prog and prog[2] else "")
-                prog_lbl.setStyleSheet("color: #555; font-size: 9pt;")
+                prog_lbl.setFont(QFont("Arial", 9))
                 self._progress_labels[scan_name] = prog_lbl
                 row.addWidget(prog_lbl)
 
@@ -393,7 +502,7 @@ class OrderGroupWidget(QFrame):
                 root.addLayout(row)
         else:
             empty_lbl = QLabel("(no twin checks yet)")
-            empty_lbl.setStyleSheet("color: #999; font-style: italic; font-size: 9pt;")
+            empty_lbl.setFont(QFont("Arial", 9))
             root.addWidget(empty_lbl)
 
         # --- Separator before action buttons ---
@@ -405,15 +514,9 @@ class OrderGroupWidget(QFrame):
         # --- Action buttons (only for real orders, not Unassigned) ---
         if self.batch.order_input != UNASSIGNED:
             if self.batch.status == "pending":
-                confirm_btn = QPushButton("Confirm Order  →  Upload")
-                confirm_btn.setFont(QFont("Arial", 11, QFont.Bold))
+                confirm_btn = QPushButton("Confirm Order")
                 confirm_btn.setMinimumHeight(36)
                 confirm_btn.setEnabled(bool(self.batch.twin_checks))
-                confirm_btn.setStyleSheet(
-                    "QPushButton { background-color: #1a6b1a; color: white; border: none; border-radius: 4px; }"
-                    "QPushButton:hover { background-color: #145214; }"
-                    "QPushButton:disabled { background-color: #aaa; color: #ddd; }"
-                )
                 confirm_btn.clicked.connect(
                     lambda: self.confirm_requested.emit(self.batch.order_input)
                 )
@@ -427,12 +530,7 @@ class OrderGroupWidget(QFrame):
 
             elif self.batch.status == "error":
                 retry_btn = QPushButton("Retry Upload")
-                retry_btn.setFont(QFont("Arial", 11, QFont.Bold))
                 retry_btn.setMinimumHeight(36)
-                retry_btn.setStyleSheet(
-                    "QPushButton { background-color: #b34700; color: white; border: none; border-radius: 4px; }"
-                    "QPushButton:hover { background-color: #8f3800; }"
-                )
                 retry_btn.clicked.connect(
                     lambda: self.retry_requested.emit(self.batch.order_input)
                 )
@@ -443,6 +541,23 @@ class OrderGroupWidget(QFrame):
         lbl = self._progress_labels.get(scan_name)
         if lbl is not None:
             lbl.setText(msg if msg else f"{cur}/{tot}")
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasFormat(DraggableScanLabel.MIME_TYPE):
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasFormat(DraggableScanLabel.MIME_TYPE):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        if not event.mimeData().hasFormat(DraggableScanLabel.MIME_TYPE):
+            return
+        payload = event.mimeData().data(DraggableScanLabel.MIME_TYPE).data().decode()
+        src_order, scan_name = payload.split("\n", 1)
+        if src_order != self.batch.order_input:
+            self.drop_scan_requested.emit(src_order, scan_name, self.batch.order_input)
+        event.acceptProposedAction()
 
 
 # ---------------------------------------------------------------------------
@@ -471,11 +586,15 @@ class ScannerOrderQueueGUI(QMainWindow):
         # Debounce flag: prevents multiple rapid structural rebuilds in one event-loop cycle
         self._rebuild_queued = False
 
+        # Currently settling scans: {scan_name: (file_count, size_mb)}
+        self._settling: Dict[str, tuple] = {}
+
         self._build_ui()
 
         # Scanner worker
         self.scanner = ScanQueueWorker()
         self.scanner.scan_settled.connect(self._on_scan_settled)
+        self.scanner.settling_update.connect(self._on_settling_update)
         self.scanner.status_update.connect(lambda m: self._log(m, "INFO"))
         self.scanner.path_changed.connect(self._on_path_changed)
         self.scanner.start()
@@ -489,16 +608,27 @@ class ScannerOrderQueueGUI(QMainWindow):
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
-        root = QHBoxLayout(central)
-        root.setContentsMargins(8, 8, 8, 8)
-        root.setSpacing(8)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        content = QWidget()
+        content_layout = QHBoxLayout(content)
+        content_layout.setContentsMargins(8, 8, 8, 8)
+        content_layout.setSpacing(8)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self._build_left_panel())
         splitter.addWidget(self._build_right_panel())
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
-        root.addWidget(splitter)
+        content_layout.addWidget(splitter)
+        root.addWidget(content)
+
+        # Floating stripe — width = 1/8 of window, sits just above the bottom edge
+        self._stripe = StripeWidget(height=22, parent=central)
+        self._stripe.raise_()
+        QTimer.singleShot(0, self._update_stripe_geometry)
 
     def _build_left_panel(self) -> QWidget:
         panel = QWidget()
@@ -520,14 +650,20 @@ class ScannerOrderQueueGUI(QMainWindow):
         add_btn = QPushButton("Add Order")
         add_btn.setFont(QFont("Arial", 12, QFont.Bold))
         add_btn.setMinimumHeight(46)
-        add_btn.setStyleSheet(
-            "QPushButton { background-color: #1565c0; color: white; border: none; border-radius: 4px; }"
-            "QPushButton:hover { background-color: #0d47a1; }"
-        )
         add_btn.clicked.connect(self._add_order)
         og.addWidget(add_btn)
 
         layout.addWidget(order_group)
+
+        # --- Settling scans ---
+        self._settling_group = QGroupBox("Settling")
+        sg = QVBoxLayout(self._settling_group)
+        self._settling_label = QLabel("(none)")
+        self._settling_label.setFont(QFont("Courier", 9))
+        self._settling_label.setWordWrap(True)
+        sg.addWidget(self._settling_label)
+        self._settling_group.setVisible(False)
+        layout.addWidget(self._settling_group)
 
         # --- Scanner path ---
         path_group = QGroupBox("Scanner Path")
@@ -627,6 +763,7 @@ class ScannerOrderQueueGUI(QMainWindow):
             card.move_up_requested.connect(self._on_move_up)
             card.move_down_requested.connect(self._on_move_down)
             card.retry_requested.connect(self._on_retry_order)
+            card.drop_scan_requested.connect(self._on_drop_scan)
             self._order_cards[batch.order_input] = card
             self._queue_layout.insertWidget(i, card)
 
@@ -636,12 +773,14 @@ class ScannerOrderQueueGUI(QMainWindow):
 
     def _on_scan_settled(self, scan_name: str):
         self.scanner.add_to_processed(scan_name)
+        self._settling.pop(scan_name, None)
+        self._update_settling_display()
 
-        # Find the active batch
         active = self._get_active_batch()
         if scan_name not in active.twin_checks:
             active.twin_checks.append(scan_name)
 
+        self._warn_if_duplicate(scan_name)
         self._log(f"📷 Settled: {scan_name} → {active.display_name}", "SUCCESS")
         self._rebuild_right_panel()
 
@@ -755,12 +894,14 @@ class ScannerOrderQueueGUI(QMainWindow):
     # Upload callbacks
     # ------------------------------------------------------------------
 
-    def _on_order_resolved(self, order_input: str, order_no: str, email: str):
+    def _on_order_resolved(self, order_input: str, order_no: str, email: str, customer_name: str):
         batch = self._find_batch(order_input)
         if batch:
             batch.order_no = order_no
             batch.email = email
-        self._log(f"Resolved {order_input} → #{order_no} ({email})", "INFO")
+            batch.customer_name = customer_name
+        name_str = f" ({customer_name})" if customer_name else ""
+        self._log(f"Resolved {order_input} → #{order_no}{name_str} — {email}", "INFO")
         self._rebuild_right_panel()
 
     def _on_scan_upload_started(self, order_input: str, scan_name: str, dest: str):
@@ -926,6 +1067,57 @@ class ScannerOrderQueueGUI(QMainWindow):
             self._log_text.verticalScrollBar().maximum()
         )
 
+    def _on_settling_update(self, scan_name: str, file_count: int, size_mb: float):
+        self._settling[scan_name] = (file_count, size_mb)
+        self._update_settling_display()
+
+    def _update_settling_display(self):
+        if not self._settling:
+            self._settling_group.setVisible(False)
+            return
+        lines = [f"{n}  —  {c} files, {s:.1f} MB"
+                 for n, (c, s) in self._settling.items()]
+        self._settling_label.setText("\n".join(lines))
+        self._settling_group.setVisible(True)
+
+    def _warn_if_duplicate(self, scan_name: str):
+        owners = [b.display_name for b in self.order_queue
+                  if scan_name in b.twin_checks]
+        if len(owners) > 1:
+            QMessageBox.warning(
+                self, "Duplicate Twin Check",
+                f"{scan_name} appears in multiple orders:\n"
+                + "\n".join(f"  • {o}" for o in owners)
+            )
+
+    def _on_drop_scan(self, src_order: str, scan_name: str, dst_order: str):
+        src = self._find_batch(src_order)
+        dst = self._find_batch(dst_order)
+        if not src or not dst:
+            return
+        if scan_name in src.twin_checks:
+            src.twin_checks.remove(scan_name)
+        if scan_name not in dst.twin_checks:
+            dst.twin_checks.append(scan_name)
+        self._warn_if_duplicate(scan_name)
+        self._log(f"Dropped {scan_name}: {src.display_name} → {dst.display_name}", "INFO")
+        self._rebuild_right_panel()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_stripe_geometry()
+
+    def _update_stripe_geometry(self):
+        if not hasattr(self, '_stripe'):
+            return
+        cw = self.centralWidget()
+        if not cw:
+            return
+        stripe_w = cw.width() // 8
+        stripe_h = self._stripe.height()
+        y = cw.height() - stripe_h - 50   # 50px gap from bottom edge
+        self._stripe.setGeometry(0, y, stripe_w, stripe_h)
+
     def closeEvent(self, event):
         self.scanner.stop()
         self.scanner.wait(2000)
@@ -938,17 +1130,47 @@ class ScannerOrderQueueGUI(QMainWindow):
 # Entry point
 # ---------------------------------------------------------------------------
 
+LIGHT_THEME = """
+    QMainWindow { background-color: #d3d3d3; color: #000000; }
+    QWidget     { background-color: #d3d3d3; color: #000000; }
+    QLabel      { color: #000000; }
+    QGroupBox {
+        font-weight: bold; font-size: 11pt; color: #000000;
+        border: 2px solid #808080; border-radius: 3px;
+        margin-top: 10px; padding-top: 10px;
+        background-color: #e8e8e8;
+    }
+    QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #000000; }
+    QLineEdit  { background-color: white; color: #000000; border: 1px solid #808080; padding: 5px; font-size: 11pt; }
+    QPushButton {
+        background-color: #c0c0c0; color: #000000;
+        border: 1px solid #808080; padding: 5px 15px;
+        min-height: 25px; font-size: 11pt; font-weight: bold;
+    }
+    QPushButton:hover    { background-color: #b0b0b0; }
+    QPushButton:pressed  { background-color: #a0a0a0; }
+    QPushButton:disabled { background-color: #e0e0e0; color: #808080; }
+    QTextEdit  { background-color: white; color: #000000; border: 1px solid #808080; font-size: 10pt; }
+    QScrollArea { background-color: #d3d3d3; border: none; }
+    QProgressBar {
+        border: 1px solid #808080; background-color: #e8e8e8;
+        color: #000000; text-align: center; font-size: 10pt;
+    }
+    QProgressBar::chunk { background-color: #4a9eff; }
+"""
+
+
 def main():
     import signal
 
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")
 
     def _sigint(sig, frame):
         app.quit()
         sys.exit(0)
     signal.signal(signal.SIGINT, _sigint)
 
+    app.setStyleSheet(LIGHT_THEME)
     win = ScannerOrderQueueGUI()
     win.show()
     sys.exit(app.exec())
