@@ -97,12 +97,24 @@ class OrderBatch:
 
     def __init__(self, order_input: str):
         self.order_input: str = order_input          # exactly what the user typed
+
+        # Parse "343432s" → number "343432", tags ["s"]
+        m = re.match(r"^#?(\d+)(.*)$", order_input)
+        if m:
+            self.order_number: str = m.group(1)
+            trailing = (m.group(2) or "").strip().lstrip(" ,")
+            self.pending_tags: List[str] = [t for t in re.split(r"[,\s]+", trailing) if t.strip()]
+        else:
+            self.order_number = order_input
+            self.pending_tags = []
+
         self.twin_checks: List[str] = []             # settled scan folder names
         self.status: str = "pending"                 # pending | uploading | completed | error
-        self.error_msg: str = ""       # short last-line summary shown in card
-        self.error_detail: str = ""    # full traceback for tooltip / details dialog
+        self.error_msg: str = ""
+        self.error_detail: str = ""
         # Populated at confirm time
-        self.order_no: Optional[str] = None          # e.g. "1232323"
+        self.order_no: Optional[str] = None          # resolved Shopify order number
+        self.order_gid: Optional[str] = None         # Shopify GID — needed for tagging
         self.email: Optional[str] = None
         self.customer_name: Optional[str] = None
         # Per-scan upload progress: {scan_name: (current, total, msg)}
@@ -112,9 +124,8 @@ class OrderBatch:
     def display_name(self) -> str:
         if self.order_input == UNASSIGNED:
             return "Unassigned"
-        if self.order_no:
-            return f"Order #{self.order_no}"
-        return f"Order {self.order_input}"
+        num = self.order_no or self.order_number
+        return f"Order #{num}"
 
 
 # ---------------------------------------------------------------------------
@@ -271,17 +282,20 @@ class ScanQueueWorker(QThread):
 class UploadOrderWorker(QThread):
     """Looks up an order in Shopify and uploads all its twin check folders."""
 
-    order_resolved = Signal(str, str, str, str)      # order_input, order_no, email, customer_name
-    scan_upload_started = Signal(str, str, str)      # order_input, scan_name, dest
+    order_resolved = Signal(str, str, str, str, str)  # order_input, order_no, email, customer_name, order_gid
+    scan_upload_started = Signal(str, str, str)       # order_input, scan_name, dest
     scan_upload_progress = Signal(str, str, int, int, str)  # order_input, scan_name, curr, total, msg
-    upload_completed = Signal(str, int)              # order_input, total_files
-    upload_error = Signal(str, str)                  # order_input, error_msg
+    upload_completed = Signal(str, int)               # order_input, total_files
+    tags_applied = Signal(str, list)                  # order_input, tags
+    upload_error = Signal(str, str)                   # order_input, error_msg
 
-    def __init__(self, order_input: str, twin_checks: List[str], scan_root: Path):
+    def __init__(self, order_input: str, twin_checks: List[str], scan_root: Path,
+                 pending_tags: List[str] = None):
         super().__init__()
         self.order_input = order_input
         self.twin_checks = list(twin_checks)
         self.scan_root = scan_root
+        self.pending_tags = list(pending_tags or [])
 
     def run(self):
         try:
@@ -298,13 +312,14 @@ class UploadOrderWorker(QThread):
 
             order_node = results[0]
             order_no = (order_node.get("name") or "").lstrip("#")
+            order_gid = order_node.get("id") or order_node.get("admin_graphql_api_id") or ""
             customer = order_node.get("customer") or {}
             email = (customer.get("email") or order_node.get("email") or "unknown").strip().lower()
             first = customer.get("firstName") or customer.get("first_name") or ""
             last  = customer.get("lastName")  or customer.get("last_name")  or ""
             customer_name = (f"{first} {last}".strip()
                              or customer.get("displayName") or "")
-            self.order_resolved.emit(self.order_input, order_no, email, customer_name)
+            self.order_resolved.emit(self.order_input, order_no, email, customer_name, order_gid)
 
             # --- Dropbox folder ---
             _, order_path = router.ensure_customer_order_folder(order_node)
@@ -339,6 +354,16 @@ class UploadOrderWorker(QThread):
                     self.scan_upload_progress.emit(
                         self.order_input, scan_name, 0, 0, f"❌ {e}"
                     )
+
+            # --- Apply Shopify tags if any were specified ---
+            if self.pending_tags and order_gid:
+                try:
+                    router.order_add_tags(order_gid, self.pending_tags)
+                    self.tags_applied.emit(self.order_input, self.pending_tags)
+                except Exception as tag_err:
+                    self.upload_error.emit(self.order_input,
+                                           f"Upload done but tagging failed: {tag_err}")
+                    return
 
             self.upload_completed.emit(self.order_input, total_uploaded)
 
@@ -400,11 +425,12 @@ class OrderGroupWidget(QFrame):
     to avoid expensive full-panel rebuilds on every upload tick.
     """
 
-    confirm_requested = Signal(str)            # order_input
-    move_up_requested = Signal(str, str)       # order_input, scan_name
-    move_down_requested = Signal(str, str)     # order_input, scan_name
-    retry_requested = Signal(str)              # order_input
+    confirm_requested = Signal(str)              # order_input
+    move_up_requested = Signal(str, str)         # order_input, scan_name
+    move_down_requested = Signal(str, str)       # order_input, scan_name
+    retry_requested = Signal(str)                # order_input
     drop_scan_requested = Signal(str, str, str)  # src_order_input, scan_name, dst_order_input
+    change_tags_requested = Signal(str)          # order_input
 
     def __init__(self, batch: OrderBatch, is_active: bool,
                  has_prev: bool, has_next: bool, parent=None):
@@ -435,6 +461,23 @@ class OrderGroupWidget(QFrame):
         status_lbl = QLabel(f"[{self.batch.status.upper()}]")
         status_lbl.setFont(QFont("Arial", 9))
         header_row.addWidget(status_lbl)
+
+        if self.batch.pending_tags or self.batch.status == "pending":
+            tags_text = f"tags: {', '.join(self.batch.pending_tags)}" if self.batch.pending_tags else "tags: —"
+            tags_lbl = QLabel(f"[{tags_text}]")
+            tags_lbl.setFont(QFont("Arial", 9))
+            header_row.addWidget(tags_lbl)
+
+            if self.batch.status == "pending" and self.batch.order_input != UNASSIGNED:
+                edit_btn = QPushButton("✎")
+                edit_btn.setFixedSize(22, 22)
+                edit_btn.setFont(QFont("Arial", 9))
+                edit_btn.setToolTip("Edit tags")
+                edit_btn.clicked.connect(
+                    lambda: self.change_tags_requested.emit(self.batch.order_input)
+                )
+                header_row.addWidget(edit_btn)
+
         header_row.addStretch()
         root.addLayout(header_row)
 
@@ -764,6 +807,7 @@ class ScannerOrderQueueGUI(QMainWindow):
             card.move_down_requested.connect(self._on_move_down)
             card.retry_requested.connect(self._on_retry_order)
             card.drop_scan_requested.connect(self._on_drop_scan)
+            card.change_tags_requested.connect(self._on_change_tags)
             self._order_cards[batch.order_input] = card
             self._queue_layout.insertWidget(i, card)
 
@@ -839,11 +883,13 @@ class ScannerOrderQueueGUI(QMainWindow):
         self._log(f"Starting upload for {order_input}…", "INFO")
 
         scan_root = Path(router.get_noritsu_root())
-        worker = UploadOrderWorker(order_input, batch.twin_checks, scan_root)
+        worker = UploadOrderWorker(order_input, batch.twin_checks, scan_root,
+                                   pending_tags=batch.pending_tags)
         worker.order_resolved.connect(self._on_order_resolved)
         worker.scan_upload_started.connect(self._on_scan_upload_started)
         worker.scan_upload_progress.connect(self._on_scan_upload_progress)
         worker.upload_completed.connect(self._on_upload_completed)
+        worker.tags_applied.connect(self._on_tags_applied)
         worker.upload_error.connect(self._on_upload_error)
         self._upload_workers[order_input] = worker
         worker.start()
@@ -894,14 +940,47 @@ class ScannerOrderQueueGUI(QMainWindow):
     # Upload callbacks
     # ------------------------------------------------------------------
 
-    def _on_order_resolved(self, order_input: str, order_no: str, email: str, customer_name: str):
+    def _on_order_resolved(self, order_input: str, order_no: str, email: str,
+                           customer_name: str, order_gid: str):
         batch = self._find_batch(order_input)
         if batch:
             batch.order_no = order_no
+            batch.order_gid = order_gid
             batch.email = email
             batch.customer_name = customer_name
         name_str = f" ({customer_name})" if customer_name else ""
         self._log(f"Resolved {order_input} → #{order_no}{name_str} — {email}", "INFO")
+        self._rebuild_right_panel()
+
+    def _on_tags_applied(self, order_input: str, tags: list):
+        self._log(f"✅ Tags applied to {order_input}: {', '.join(tags)}", "SUCCESS")
+
+    def _on_change_tags(self, order_input: str):
+        batch = self._find_batch(order_input)
+        if not batch:
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Edit Tags — {batch.display_name}")
+        dlg.setMinimumWidth(320)
+        lay = QVBoxLayout(dlg)
+
+        lay.addWidget(QLabel("Tags (comma-separated, e.g. s, bs):"))
+        inp = QLineEdit(", ".join(batch.pending_tags))
+        inp.setPlaceholderText("e.g. s, bs, sp")
+        lay.addWidget(inp)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lay.addWidget(btns)
+
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        text = inp.text().strip()
+        batch.pending_tags = [t.strip() for t in text.split(",") if t.strip()]
+        self._log(f"Tags updated for {order_input}: {', '.join(batch.pending_tags) or '(none)'}", "INFO")
         self._rebuild_right_panel()
 
     def _on_scan_upload_started(self, order_input: str, scan_name: str, dest: str):
