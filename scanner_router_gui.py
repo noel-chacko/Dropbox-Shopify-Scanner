@@ -1767,12 +1767,25 @@ class ScannerRouterGUI(QMainWindow):
     
     def closeEvent(self, event):
         """Handle window close"""
+        # Stop the refresh timer before anything else
+        if hasattr(self, 'update_timer'):
+            self.update_timer.stop()
+
+        # Null out all router callbacks so background upload threads
+        # don't fire signals into widgets that are being torn down
+        for key in list(router.gui_callbacks.keys()):
+            router.gui_callbacks[key] = None
+
         if self.worker:
             self.worker.stop()
-            self.worker.wait()
+            if not self.worker.wait(5000):   # 5s timeout, then force
+                self.worker.terminate()
+
         if self.order_worker_thread:
             self.order_worker_thread.quit()
-            self.order_worker_thread.wait()
+            if not self.order_worker_thread.wait(3000):
+                self.order_worker_thread.terminate()
+
         event.accept()
 
 def exception_handler(exc_type, exc_value, exc_traceback):

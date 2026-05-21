@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(cat /Users/noelchacko/Dropbox+Shopify+Scanner/.processed_jobs.json 2>/dev/null || echo \"File not found\")",
-      "Bash(python3 -c \"import ast; ast.parse\\(open\\('scanner_order_queue_gui.py'\\).read\\(\\)\\); print\\('OK'\\)\")"
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('scanner_order_queue_gui.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('scanner_router_gui.py'\\).read\\(\\)\\); print\\('OK'\\)\")"
     ]
   }
 }
