@@ -686,6 +686,18 @@ class ScannerOrderQueueGUI(QMainWindow):
         # Floating stripe — width = 1/8 of window, sits just above the bottom edge
         self._stripe = StripeWidget(height=22, parent=central)
         self._stripe.raise_()
+
+        # PHOTOLounge wordmark, small, just under the stripe
+        self._logo = QLabel(central)
+        self._logo.setText(
+            '<span style="color:#E6285C;">PHOTO</span>'
+            '<span style="color:#F5A623;">Lounge</span>'
+        )
+        self._logo.setFont(QFont("Arial", 10, QFont.Bold))
+        self._logo.setStyleSheet("background: transparent;")
+        self._logo.adjustSize()
+        self._logo.raise_()
+
         QTimer.singleShot(0, self._update_stripe_geometry)
 
     def _build_left_panel(self) -> QWidget:
@@ -1221,6 +1233,10 @@ class ScannerOrderQueueGUI(QMainWindow):
         stripe_h = self._stripe.height()
         y = cw.height() - stripe_h - 50   # 50px gap from bottom edge
         self._stripe.setGeometry(0, y, stripe_w, stripe_h)
+
+        # Logo sits just under the stripe, left-aligned with it
+        if hasattr(self, '_logo'):
+            self._logo.move(2, y + stripe_h + 3)
 
     def closeEvent(self, event):
         # Stop the scanner loop (responsive: its longest sleep is ~5s)
