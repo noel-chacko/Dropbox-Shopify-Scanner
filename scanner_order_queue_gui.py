@@ -279,10 +279,6 @@ class ScanQueueWorker(QThread):
 # Upload worker
 # ---------------------------------------------------------------------------
 
-class _UploadAborted(Exception):
-    """Raised from the progress callback to unwind an in-flight upload on quit."""
-
-
 class UploadOrderWorker(QThread):
     """Looks up an order in Shopify and uploads all its twin check folders."""
 
@@ -300,11 +296,6 @@ class UploadOrderWorker(QThread):
         self.twin_checks = list(twin_checks)
         self.scan_root = scan_root
         self.pending_tags = list(pending_tags or [])
-        self._abort = False
-
-    def abort(self):
-        """Request a cooperative stop; checked between files via the callback."""
-        self._abort = True
 
     def run(self):
         try:
@@ -336,8 +327,6 @@ class UploadOrderWorker(QThread):
             # --- Upload twin checks ---
             total_uploaded = 0
             for scan_name in self.twin_checks:
-                if self._abort:
-                    return
                 scan_dir = self.scan_root / scan_name
                 if not scan_dir.exists():
                     self.scan_upload_progress.emit(
@@ -351,8 +340,6 @@ class UploadOrderWorker(QThread):
 
                 def _make_cb(sn):
                     def cb(cur, tot, msg):
-                        if self._abort:
-                            raise _UploadAborted()
                         self.scan_upload_progress.emit(self.order_input, sn, cur, tot, msg)
                     return cb
 
@@ -363,8 +350,6 @@ class UploadOrderWorker(QThread):
                         self.order_input, scan_name, uploaded, uploaded,
                         f"✅ {uploaded} files uploaded"
                     )
-                except _UploadAborted:
-                    return
                 except Exception as e:
                     self.scan_upload_progress.emit(
                         self.order_input, scan_name, 0, 0, f"❌ {e}"
@@ -802,16 +787,6 @@ class ScannerOrderQueueGUI(QMainWindow):
 
     def _do_rebuild(self):
         """Clear and recreate all order group widgets, updating _order_cards."""
-        # Never tear down widgets while the user is mid-drag (or holding the
-        # mouse): a drag spins a nested event loop, so deleting the dragged
-        # DraggableScanLabel/QDrag here is a use-after-free → hard crash on
-        # macOS. Re-arm and rebuild once the button is released.
-        if QApplication.mouseButtons() & Qt.LeftButton:
-            # Keep _rebuild_queued True so other requests coalesce; poll back
-            # shortly rather than busy-looping at 0 ms.
-            QTimer.singleShot(100, self._do_rebuild)
-            return
-
         self._rebuild_queued = False
         self._order_cards.clear()
 
@@ -1223,36 +1198,10 @@ class ScannerOrderQueueGUI(QMainWindow):
         self._stripe.setGeometry(0, y, stripe_w, stripe_h)
 
     def closeEvent(self, event):
-        # Stop the scanner loop (responsive: its longest sleep is ~5s)
         self.scanner.stop()
-        if not self.scanner.wait(6000):
-            self.scanner.terminate()
-            self.scanner.wait()
-
-        # Request cooperative abort on every upload worker FIRST, so they
-        # unwind between files instead of being killed mid-I/O. terminate()
-        # on a thread mid-upload is the documented crash path on macOS.
-        for worker in list(self._upload_workers.values()):
-            worker.abort()
-
-        # Disconnect all signals from upload workers before waiting —
-        # threads may still be mid-upload; disconnecting prevents them
-        # emitting into widgets that are already being torn down
-        for worker in list(self._upload_workers.values()):
-            for sig in (worker.order_resolved, worker.scan_upload_started,
-                        worker.scan_upload_progress, worker.upload_completed,
-                        worker.tags_applied, worker.upload_error):
-                try:
-                    sig.disconnect()
-                except Exception:
-                    pass
-            # Generous wait: abort fires from the per-file callback, so the
-            # worker exits within roughly one file's upload time. terminate()
-            # stays only as a last resort to avoid "destroyed while running".
-            if not worker.wait(20000):
-                worker.terminate()
-                worker.wait()
-
+        self.scanner.wait(2000)
+        for w in self._upload_workers.values():
+            w.wait(1000)
         event.accept()
 
 
