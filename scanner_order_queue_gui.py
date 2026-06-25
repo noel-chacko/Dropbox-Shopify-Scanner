@@ -27,7 +27,7 @@ from PySide6.QtGui import QFont, QFontDatabase, QPainter, QBrush, QColor, QRegio
 
 import scanner_router_direct as router
 
-SETTLE_SECONDS = float(os.getenv("SETTLE_SECONDS", "0.7"))
+SETTLE_SECONDS = float(os.getenv("SETTLE_SECONDS", "3.0"))
 SCAN_INTERVAL = router.SCAN_INTERVAL
 UNASSIGNED = "__UNASSIGNED__"
 
@@ -364,6 +364,23 @@ class UploadOrderWorker(QThread):
                     self.upload_error.emit(self.order_input,
                                            f"Upload done but tagging failed: {tag_err}")
                     return
+
+            # --- Append this order's twin check numbers to the Shopify note ---
+            if order_gid and self.twin_checks:
+                try:
+                    existing = []
+                    try:
+                        existing = router.get_existing_twin_checks_from_dropbox(order_path)
+                    except Exception:
+                        existing = []
+                    all_twins = sorted(set(self.twin_checks) | set(existing))
+                    note_text = f"Twin Checks: {', '.join(all_twins)}"
+                    if router.order_update_note(order_gid, note_text, append=True):
+                        self.scan_upload_progress.emit(
+                            self.order_input, self.twin_checks[0], 0, 0,
+                            f"📝 Twin checks added to note: {', '.join(all_twins)}")
+                except Exception as note_err:
+                    print(f"⚠️  Failed to add twin checks to order note: {note_err}")
 
             self.upload_completed.emit(self.order_input, total_uploaded)
 

@@ -100,7 +100,7 @@ def get_noritsu_root() -> str:
 def get_noritsu_base() -> str:
     """Get base NORITSU_ROOT path (without date)"""
     return NORITSU_ROOT_BASE
-SETTLE_SECONDS = float(os.getenv("SETTLE_SECONDS", "0.5"))
+SETTLE_SECONDS = float(os.getenv("SETTLE_SECONDS", "3.0"))
 # How often (seconds) to check the watch directory for new folders
 SCAN_INTERVAL = float(os.getenv("SCAN_INTERVAL", "2"))
 CUSTOMER_LINK_FIELD_NS = os.getenv("CUSTOMER_LINK_FIELD_NS", "custom_fields")
@@ -709,6 +709,39 @@ def _is_ready(path: Path) -> bool:
         print(f"  ❌ Error checking {path.name}: {e}")
         return False
 
+def _wait_for_file_stable(file_path: Path, interval: float = 0.5,
+                          stable_checks: int = 2, timeout: float = 60.0) -> bool:
+    """Block until a file's size and mtime stop changing.
+
+    Folder-level settle detection can fire while the scanner is still writing
+    later images in the same scan, which causes half-written files to be read
+    and uploaded (showing up as half-grey images in Dropbox). This re-checks
+    the individual file right before we read it.
+
+    Returns True once the file looks fully written, or False if it never
+    settled within `timeout` seconds (caller may still attempt the upload).
+    """
+    deadline = time.time() + timeout
+    last_size = -1
+    last_mtime = -1.0
+    stable = 0
+    while time.time() < deadline:
+        try:
+            st = file_path.stat()
+            size, mtime = st.st_size, st.st_mtime
+        except OSError:
+            time.sleep(interval)
+            continue
+        if size > 0 and size == last_size and mtime == last_mtime:
+            stable += 1
+            if stable >= stable_checks:
+                return True
+        else:
+            stable = 0
+            last_size, last_mtime = size, mtime
+        time.sleep(interval)
+    return False
+
 @retry(wait=wait_exponential(multiplier=2, min=2, max=60), stop=stop_after_attempt(5), retry=retry_if_exception_type((RateLimitError, ApiError, AuthError)))
 def _upload_single_file(file_path: Path, dropbox_file: str) -> bool:
     """Upload a single file with retry logic for rate limits."""
@@ -716,7 +749,14 @@ def _upload_single_file(file_path: Path, dropbox_file: str) -> bool:
         # Skip token refresh - will happen automatically on auth error if needed
         # This makes uploads much faster
         with open(file_path, "rb") as f:
-            DBX.files_upload(f.read(), dropbox_file, mode=WriteMode.overwrite)
+            data = f.read()
+        md = DBX.files_upload(data, dropbox_file, mode=WriteMode.overwrite)
+        # Verify Dropbox stored exactly what we sent — guards against
+        # truncated/half-written uploads (half-grey images).
+        if getattr(md, "size", len(data)) != len(data):
+            raise RuntimeError(
+                f"Size mismatch for {dropbox_file}: sent {len(data)}, "
+                f"stored {getattr(md, 'size', '?')}")
         return True
     except AuthError as e:
         # Token expired - refresh and retry
@@ -725,7 +765,12 @@ def _upload_single_file(file_path: Path, dropbox_file: str) -> bool:
             refresh_dbx_if_needed()
             # Retry once after refresh
             with open(file_path, "rb") as f:
-                DBX.files_upload(f.read(), dropbox_file, mode=WriteMode.overwrite)
+                data = f.read()
+            md = DBX.files_upload(data, dropbox_file, mode=WriteMode.overwrite)
+            if getattr(md, "size", len(data)) != len(data):
+                raise RuntimeError(
+                    f"Size mismatch for {dropbox_file}: sent {len(data)}, "
+                    f"stored {getattr(md, 'size', '?')}")
             return True
         raise
     except (ApiError, RateLimitError) as e:
@@ -785,6 +830,14 @@ def upload_folder(local_dir: Path, dropbox_path: str, progress_callback=None, up
         # Upload files sequentially with delay to prevent rate limits
         for idx, (file_path, dropbox_file) in enumerate(files_to_upload):
             try:
+                if progress_callback:
+                    progress_callback(idx, total_files, f"Verifying {file_path.name}...")
+                # Guard against uploading a half-written scan (half-grey images)
+                if not _wait_for_file_stable(file_path):
+                    warn = f"⚠️  {file_path.name} still changing after wait — uploading anyway"
+                    print(warn)
+                    if progress_callback:
+                        progress_callback(idx, total_files, warn)
                 if progress_callback:
                     progress_callback(idx, total_files, f"Uploading {file_path.name}...")
                 if _upload_single_file(file_path, dropbox_file):
