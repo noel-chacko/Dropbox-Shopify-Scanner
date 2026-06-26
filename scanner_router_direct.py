@@ -742,14 +742,65 @@ def _wait_for_file_stable(file_path: Path, interval: float = 0.5,
         time.sleep(interval)
     return False
 
+
+# How long to keep re-reading a JPEG that still looks truncated, and how
+# often to retry. SMB attribute caching can make a half-written file look
+# fully written to stat(), so we validate the actual bytes instead.
+JPEG_COMPLETE_TIMEOUT = float(os.getenv("JPEG_COMPLETE_TIMEOUT", "60"))
+JPEG_COMPLETE_INTERVAL = float(os.getenv("JPEG_COMPLETE_INTERVAL", "1.0"))
+
+
+class IncompleteUploadError(Exception):
+    """Raised when a file is not a complete image and must not be uploaded."""
+
+
+def _jpeg_bytes_complete(data: bytes) -> bool:
+    """A complete JPEG starts with SOI (FFD8) and ends with EOI (FFD9)."""
+    return len(data) >= 4 and data[:2] == b"\xff\xd8" and data[-2:] == b"\xff\xd9"
+
+
+def _load_upload_bytes(file_path: Path) -> bytes:
+    """Read a file's bytes for upload.
+
+    For JPEGs we re-read until the on-disk data is a structurally complete
+    image (ends with the FFD9 end-of-image marker). This defeats SMB
+    attribute caching, where a still-being-written scan looks settled to
+    stat() but only part of the file is actually readable — the cause of the
+    half-grey images in Dropbox. Raises IncompleteUploadError if the file
+    never completes within JPEG_COMPLETE_TIMEOUT, so we fail loudly instead
+    of uploading a truncated scan.
+    """
+    is_jpeg = file_path.suffix.lower() in (".jpg", ".jpeg")
+    if not is_jpeg:
+        with open(file_path, "rb") as f:
+            return f.read()
+
+    deadline = time.time() + JPEG_COMPLETE_TIMEOUT
+    last_len = -1
+    while True:
+        try:
+            with open(file_path, "rb") as f:
+                data = f.read()
+        except OSError:
+            data = b""
+        if _jpeg_bytes_complete(data):
+            return data
+        if time.time() >= deadline:
+            raise IncompleteUploadError(
+                f"{file_path.name} is not a complete JPEG after "
+                f"{JPEG_COMPLETE_TIMEOUT:.0f}s (read {len(data)} bytes, "
+                f"missing FFD9 end marker) — refusing to upload a grey scan")
+        last_len = len(data)
+        time.sleep(JPEG_COMPLETE_INTERVAL)
+
+
 @retry(wait=wait_exponential(multiplier=2, min=2, max=60), stop=stop_after_attempt(5), retry=retry_if_exception_type((RateLimitError, ApiError, AuthError)))
 def _upload_single_file(file_path: Path, dropbox_file: str) -> bool:
     """Upload a single file with retry logic for rate limits."""
     try:
         # Skip token refresh - will happen automatically on auth error if needed
         # This makes uploads much faster
-        with open(file_path, "rb") as f:
-            data = f.read()
+        data = _load_upload_bytes(file_path)
         md = DBX.files_upload(data, dropbox_file, mode=WriteMode.overwrite)
         # Verify Dropbox stored exactly what we sent — guards against
         # truncated/half-written uploads (half-grey images).
@@ -764,8 +815,7 @@ def _upload_single_file(file_path: Path, dropbox_file: str) -> bool:
         if 'expired' in error_str or 'expired_access_token' in error_str:
             refresh_dbx_if_needed()
             # Retry once after refresh
-            with open(file_path, "rb") as f:
-                data = f.read()
+            data = _load_upload_bytes(file_path)
             md = DBX.files_upload(data, dropbox_file, mode=WriteMode.overwrite)
             if getattr(md, "size", len(data)) != len(data):
                 raise RuntimeError(
