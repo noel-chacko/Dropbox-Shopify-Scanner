@@ -27,7 +27,7 @@ from PySide6.QtGui import QFont, QFontDatabase, QPainter, QBrush, QColor, QRegio
 
 import scanner_router_direct as router
 
-SETTLE_SECONDS = float(os.getenv("SETTLE_SECONDS", "3.0"))
+SETTLE_SECONDS = float(os.getenv("SETTLE_SECONDS", "5.0"))
 SCAN_INTERVAL = router.SCAN_INTERVAL
 UNASSIGNED = "__UNASSIGNED__"
 
@@ -332,6 +332,16 @@ class UploadOrderWorker(QThread):
                     self.scan_upload_progress.emit(
                         self.order_input, scan_name, 0, 0,
                         f"⚠️ Folder missing: {scan_name}"
+                    )
+                    continue
+
+                # Defense in depth: re-verify the folder is fully written and
+                # every JPEG is complete right before uploading it.
+                ready, issues = router.folder_upload_ready(scan_dir)
+                if not ready:
+                    self.scan_upload_progress.emit(
+                        self.order_input, scan_name, 0, 0,
+                        f"⚠️ Skipped {scan_name}: not ready ({issues[0] if issues else 'incomplete'})"
                     )
                     continue
 
@@ -886,6 +896,28 @@ class ScannerOrderQueueGUI(QMainWindow):
                                     f"No twin checks assigned to order {order_input} yet.")
             return
 
+        # Gate: refuse to upload until every file has settled and every JPEG
+        # is a complete image. Better to wait than upload a half-grey scan.
+        scan_root = Path(router.get_noritsu_root())
+        not_ready = []
+        for sn in batch.twin_checks:
+            ok, issues = router.folder_upload_ready(scan_root / sn)
+            if not ok:
+                not_ready.extend(f"{sn} → {i}" for i in issues)
+        if not_ready:
+            shown = not_ready[:20]
+            extra = "" if len(not_ready) <= 20 else f"\n  …and {len(not_ready) - 20} more"
+            QMessageBox.warning(
+                self, "Not ready to upload",
+                f"Order {order_input} has files that are still being written "
+                "or incomplete:\n\n"
+                + "\n".join(f"  • {x}" for x in shown) + extra
+                + "\n\nWait for scanning to finish, then try again.",
+            )
+            self._log(f"Upload blocked for {order_input}: {len(not_ready)} file(s) not ready",
+                      "ERROR")
+            return
+
         reply = QMessageBox.question(
             self, "Confirm Upload",
             f"Upload {len(batch.twin_checks)} twin check(s) for order {order_input}?\n\n"
@@ -899,7 +931,6 @@ class ScannerOrderQueueGUI(QMainWindow):
         self._rebuild_right_panel()
         self._log(f"Starting upload for {order_input}…", "INFO")
 
-        scan_root = Path(router.get_noritsu_root())
         worker = UploadOrderWorker(order_input, batch.twin_checks, scan_root,
                                    pending_tags=batch.pending_tags)
         worker.order_resolved.connect(self._on_order_resolved)
