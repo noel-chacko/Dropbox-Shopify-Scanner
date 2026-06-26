@@ -100,7 +100,7 @@ def get_noritsu_root() -> str:
 def get_noritsu_base() -> str:
     """Get base NORITSU_ROOT path (without date)"""
     return NORITSU_ROOT_BASE
-SETTLE_SECONDS = float(os.getenv("SETTLE_SECONDS", "3.0"))
+SETTLE_SECONDS = float(os.getenv("SETTLE_SECONDS", "5.0"))
 # How often (seconds) to check the watch directory for new folders
 SCAN_INTERVAL = float(os.getenv("SCAN_INTERVAL", "2"))
 CUSTOMER_LINK_FIELD_NS = os.getenv("CUSTOMER_LINK_FIELD_NS", "custom_fields")
@@ -792,6 +792,50 @@ def _load_upload_bytes(file_path: Path) -> bytes:
                 f"missing FFD9 end marker) — refusing to upload a grey scan")
         last_len = len(data)
         time.sleep(JPEG_COMPLETE_INTERVAL)
+
+
+def folder_upload_ready(scan_dir: Path, exclude_files: set = None):
+    """Check whether every file in a scan folder is safe to upload.
+
+    A folder is ready only when each file has stopped changing (last write
+    older than SETTLE_SECONDS) and every JPEG is a structurally complete
+    image (FFD8 start + FFD9 end). Returns (ready: bool, issues: list[str]).
+    Used to gate the Confirm Upload button so half-written scans never go up.
+    """
+    issues = []
+    _excluded = {n.lower() for n in (exclude_files or {"thumbs.db"})}
+    try:
+        if not scan_dir.exists():
+            return False, [f"{scan_dir.name}: folder missing"]
+        files = [f for f in scan_dir.rglob("*")
+                 if f.is_file() and f.name.lower() not in _excluded]
+        if not files:
+            return False, [f"{scan_dir.name}: no files yet"]
+        now = time.time()
+        for f in files:
+            try:
+                st = f.stat()
+            except OSError:
+                issues.append(f"{f.name}: cannot read")
+                continue
+            if st.st_size == 0:
+                issues.append(f"{f.name}: empty (0 bytes)")
+                continue
+            if now - st.st_mtime < SETTLE_SECONDS:
+                issues.append(f"{f.name}: still being written")
+                continue
+            if f.suffix.lower() in (".jpg", ".jpeg"):
+                try:
+                    with open(f, "rb") as fh:
+                        data = fh.read()
+                except OSError:
+                    issues.append(f"{f.name}: cannot read")
+                    continue
+                if not _jpeg_bytes_complete(data):
+                    issues.append(f"{f.name}: incomplete JPEG (truncated)")
+    except Exception as e:
+        return False, [f"{scan_dir.name}: {e}"]
+    return (len(issues) == 0), issues
 
 
 @retry(wait=wait_exponential(multiplier=2, min=2, max=60), stop=stop_after_attempt(5), retry=retry_if_exception_type((RateLimitError, ApiError, AuthError)))
