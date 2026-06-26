@@ -109,7 +109,7 @@ class OrderBatch:
             self.pending_tags = []
 
         self.twin_checks: List[str] = []             # settled scan folder names
-        self.status: str = "pending"                 # pending | uploading | completed | error
+        self.status: str = "pending"                 # pending | queued | uploading | completed | error
         self.error_msg: str = ""
         self.error_detail: str = ""
         # Populated at confirm time
@@ -465,6 +465,7 @@ class OrderGroupWidget(QFrame):
         self.batch = batch
         # Keyed by scan_name — updated in-place by update_scan_progress()
         self._progress_labels: Dict[str, QLabel] = {}
+        self._progress_bars: Dict[str, QProgressBar] = {}
         self._build(is_active, has_prev, has_next)
         self.setAcceptDrops(True)
 
@@ -542,8 +543,23 @@ class OrderGroupWidget(QFrame):
                 name_lbl = DraggableScanLabel(scan_name, self.batch.order_input)
                 row.addWidget(name_lbl, stretch=1)
 
-                # Progress label — always created so update_scan_progress() can find it
+                # Per-scan progress bar — only meaningful while uploading
                 prog = self.batch.progress.get(scan_name)
+                prog_bar = QProgressBar()
+                prog_bar.setFixedWidth(130)
+                prog_bar.setFixedHeight(16)
+                prog_bar.setTextVisible(True)
+                if prog and prog[1]:
+                    prog_bar.setRange(0, prog[1])
+                    prog_bar.setValue(prog[0])
+                else:
+                    prog_bar.setRange(0, 100)
+                    prog_bar.setValue(0)
+                prog_bar.setVisible(self.batch.status in ("uploading", "queued"))
+                self._progress_bars[scan_name] = prog_bar
+                row.addWidget(prog_bar)
+
+                # Progress label — always created so update_scan_progress() can find it
                 prog_lbl = QLabel(prog[2] if prog and prog[2] else "")
                 prog_lbl.setFont(QFont("Arial", 9))
                 self._progress_labels[scan_name] = prog_lbl
@@ -592,9 +608,14 @@ class OrderGroupWidget(QFrame):
                 )
                 root.addWidget(confirm_btn)
 
+            elif self.batch.status == "queued":
+                wait_lbl = QLabel("⏳ Queued — waiting for current upload to finish…")
+                wait_lbl.setFont(QFont("Arial", 9))
+                root.addWidget(wait_lbl)
+
             elif self.batch.status == "uploading":
                 pb = QProgressBar()
-                pb.setRange(0, 0)  # indeterminate spinner
+                pb.setRange(0, 0)  # indeterminate spinner (overall activity)
                 pb.setFixedHeight(22)
                 root.addWidget(pb)
 
@@ -607,10 +628,18 @@ class OrderGroupWidget(QFrame):
                 root.addWidget(retry_btn)
 
     def update_scan_progress(self, scan_name: str, cur: int, tot: int, msg: str):
-        """Update a single scan's progress label in-place — no widget rebuild needed."""
+        """Update a single scan's progress bar + label in-place — no rebuild needed."""
         lbl = self._progress_labels.get(scan_name)
         if lbl is not None:
             lbl.setText(msg if msg else f"{cur}/{tot}")
+        bar = self._progress_bars.get(scan_name)
+        if bar is not None:
+            bar.setVisible(True)
+            if tot and tot > 0:
+                bar.setRange(0, tot)
+                bar.setValue(cur)
+            else:
+                bar.setRange(0, 0)  # indeterminate until total is known
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasFormat(DraggableScanLabel.MIME_TYPE):
@@ -649,6 +678,12 @@ class ScannerOrderQueueGUI(QMainWindow):
 
         # Running upload workers keyed by order_input
         self._upload_workers: Dict[str, UploadOrderWorker] = {}
+
+        # Uploads run one at a time to avoid hammering Dropbox (rate limits).
+        # _upload_pending is a FIFO of order_inputs waiting their turn;
+        # _upload_active is the order currently uploading (or None).
+        self._upload_pending: List[str] = []
+        self._upload_active: Optional[str] = None
 
         # Live card references so progress can be updated in-place
         self._order_cards: Dict[str, "OrderGroupWidget"] = {}
@@ -927,20 +962,44 @@ class ScannerOrderQueueGUI(QMainWindow):
         if reply != QMessageBox.Yes:
             return
 
-        batch.status = "uploading"
+        # Queue it rather than starting immediately — uploads run one at a
+        # time so spam-confirming many orders can't overload Dropbox.
+        batch.status = "queued"
+        if order_input not in self._upload_pending:
+            self._upload_pending.append(order_input)
+        self._log(f"Queued {order_input} for upload "
+                  f"(position {len(self._upload_pending)})", "INFO")
         self._rebuild_right_panel()
-        self._log(f"Starting upload for {order_input}…", "INFO")
+        self._start_next_upload()
 
-        worker = UploadOrderWorker(order_input, batch.twin_checks, scan_root,
-                                   pending_tags=batch.pending_tags)
-        worker.order_resolved.connect(self._on_order_resolved)
-        worker.scan_upload_started.connect(self._on_scan_upload_started)
-        worker.scan_upload_progress.connect(self._on_scan_upload_progress)
-        worker.upload_completed.connect(self._on_upload_completed)
-        worker.tags_applied.connect(self._on_tags_applied)
-        worker.upload_error.connect(self._on_upload_error)
-        self._upload_workers[order_input] = worker
-        worker.start()
+    def _start_next_upload(self):
+        """Start the next queued upload, if nothing is currently uploading."""
+        if self._upload_active is not None:
+            return
+        while self._upload_pending:
+            order_input = self._upload_pending.pop(0)
+            batch = self._find_batch(order_input)
+            # Skip if it was removed or is no longer waiting (e.g. cancelled)
+            if not batch or batch.status != "queued":
+                continue
+
+            self._upload_active = order_input
+            batch.status = "uploading"
+            self._log(f"Starting upload for {order_input}…", "INFO")
+            self._rebuild_right_panel()
+
+            scan_root = Path(router.get_noritsu_root())
+            worker = UploadOrderWorker(order_input, batch.twin_checks, scan_root,
+                                       pending_tags=batch.pending_tags)
+            worker.order_resolved.connect(self._on_order_resolved)
+            worker.scan_upload_started.connect(self._on_scan_upload_started)
+            worker.scan_upload_progress.connect(self._on_scan_upload_progress)
+            worker.upload_completed.connect(self._on_upload_completed)
+            worker.tags_applied.connect(self._on_tags_applied)
+            worker.upload_error.connect(self._on_upload_error)
+            self._upload_workers[order_input] = worker
+            worker.start()
+            return
 
     # ------------------------------------------------------------------
     # Slot: move twin check down to next order
@@ -1053,8 +1112,11 @@ class ScannerOrderQueueGUI(QMainWindow):
             batch.status = "completed"
             batch.progress = {}
         self._upload_workers.pop(order_input, None)
+        if self._upload_active == order_input:
+            self._upload_active = None
         self._log(f"✅ Upload complete for {order_input}: {total_files} files total", "SUCCESS")
         self._rebuild_right_panel()
+        self._start_next_upload()
 
     def _on_upload_error(self, order_input: str, error_msg: str):
         batch = self._find_batch(order_input)
@@ -1064,9 +1126,12 @@ class ScannerOrderQueueGUI(QMainWindow):
             batch.error_msg = lines[-1] if lines else "Unknown error"
             batch.error_detail = error_msg  # full traceback available via tooltip
         self._upload_workers.pop(order_input, None)
+        if self._upload_active == order_input:
+            self._upload_active = None
         short = batch.error_msg if batch else error_msg
         self._log(f"❌ Upload error for {order_input}: {short}", "ERROR")
         self._rebuild_right_panel()
+        self._start_next_upload()
 
     def _on_retry_order(self, order_input: str):
         """Reset a failed order back to pending so it can be confirmed again."""
