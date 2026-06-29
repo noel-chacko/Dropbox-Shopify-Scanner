@@ -744,34 +744,42 @@ def _read_complete_bytes(file_path: Path) -> bytes:
     image. The only reliable signal that the scanner is finished is that the
     actual file content stops changing.
 
-    We read the whole file repeatedly (fresh handle each time) and only return
-    once the bytes are identical across FILE_STABLE_MATCHES consecutive reads
-    (spaced FILE_STABLE_INTERVAL) and, for JPEGs, the markers are present.
-    Raises IncompleteUploadError if it never stabilizes within
-    FILE_STABLE_TIMEOUT, so a partial scan is refused rather than uploaded.
+    A file is only accepted as "done" when ALL hold:
+      • it has not been modified for at least SETTLE_SECONDS (mtime is old),
+      • the bytes read match the file's reported size (no short read),
+      • for JPEGs, the FFD8/FFD9 markers are present, and
+      • the content is byte-identical across FILE_STABLE_MATCHES consecutive
+        reads (spaced FILE_STABLE_INTERVAL).
+    The mtime-age + content-identical pair is what catches the nasty case
+    where a scanner pre-allocates the file (full size + markers) and fills the
+    image body afterward — the body bytes keep changing / mtime keeps moving
+    until it's truly finished. Raises IncompleteUploadError if it never
+    stabilizes within FILE_STABLE_TIMEOUT, so a partial scan is refused.
     """
     is_jpeg = file_path.suffix.lower() in (".jpg", ".jpeg", ".jpe")
     deadline = time.time() + FILE_STABLE_TIMEOUT
     prev_hash = None
     matches = 0
+    iterations = 0
     data = b""
     while True:
+        iterations += 1
         try:
-            disk_size = file_path.stat().st_size
+            st = file_path.stat()
+            disk_size, mtime = st.st_size, st.st_mtime
         except OSError:
-            disk_size = -1
+            disk_size, mtime = -1, 0.0
         with open(file_path, "rb") as f:
             data = f.read()
-        # Bytes read must match the file's reported size — guards against a
-        # short read returning only part of the image (which would upload as
-        # a grey/incomplete file).
         size_ok = (len(data) == disk_size)
+        mtime_ok = (mtime > 0) and (time.time() - mtime > SETTLE_SECONDS)
         markers_ok = (not is_jpeg) or _jpeg_is_complete(data)
-        if len(data) > 0 and size_ok and markers_ok:
+        if len(data) > 0 and size_ok and mtime_ok and markers_ok:
             h = hashlib.md5(data).digest()
             if h == prev_hash:
                 matches += 1
                 if matches >= FILE_STABLE_MATCHES:
+                    _log_upload_read(file_path, len(data), time.time() - mtime, iterations)
                     return data
             else:
                 matches = 0
@@ -782,8 +790,30 @@ def _read_complete_bytes(file_path: Path) -> bytes:
         if time.time() >= deadline:
             raise IncompleteUploadError(
                 f"{file_path.name}: still changing or incomplete after "
-                f"{FILE_STABLE_TIMEOUT:.0f}s — refusing to upload a partial scan")
+                f"{FILE_STABLE_TIMEOUT:.0f}s (size_ok={size_ok}, "
+                f"mtime_ok={mtime_ok}, markers_ok={markers_ok}, "
+                f"read={len(data)}/{disk_size}) — refusing to upload a partial scan")
         time.sleep(FILE_STABLE_INTERVAL)
+
+
+# Optional per-file read diagnostics: set UPLOAD_READ_LOG=1 to record how each
+# file looked when accepted (bytes, seconds-since-last-write, read iterations).
+# If a grey file ever slips through, its log line shows whether it was caught
+# changing (iterations > expected) or looked done on the first read.
+_UPLOAD_READ_LOG = os.getenv("UPLOAD_READ_LOG", "0") not in ("0", "", "false", "False")
+_UPLOAD_READ_LOG_FILE = Path(__file__).parent / "upload_reads.log"
+
+
+def _log_upload_read(file_path: Path, nbytes: int, mtime_age: float, iterations: int):
+    if not _UPLOAD_READ_LOG:
+        return
+    try:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(_UPLOAD_READ_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {file_path.name}  bytes={nbytes}  "
+                    f"age={mtime_age:.1f}s  iters={iterations}\n")
+    except Exception:
+        pass
 
 
 def folder_upload_ready(scan_dir: Path, exclude_files: set = None):
@@ -837,44 +867,47 @@ def folder_upload_ready(scan_dir: Path, exclude_files: set = None):
     return (len(issues) == 0), issues
 
 
-@retry(wait=wait_exponential(multiplier=2, min=2, max=60), stop=stop_after_attempt(5), retry=retry_if_exception_type((RateLimitError, ApiError, AuthError)))
 def _upload_single_file(file_path: Path, dropbox_file: str) -> bool:
-    """Upload a single file with retry logic for rate limits."""
+    """Read a file's verified-complete bytes ONCE, then upload them.
+
+    Reading once (outside the retry) and reusing the exact same bytes for
+    every retry guarantees a rate-limit retry can never re-read the source and
+    overwrite a good upload with a different (grey) copy.
+    """
+    data = _read_complete_bytes(file_path)
+    _upload_bytes(data, dropbox_file)
+    return True
+
+
+@retry(wait=wait_exponential(multiplier=2, min=2, max=60), stop=stop_after_attempt(5), retry=retry_if_exception_type((RateLimitError, ApiError, AuthError)))
+def _upload_bytes(data: bytes, dropbox_file: str) -> None:
+    """Upload already-read bytes to Dropbox, retrying transient/rate-limit
+    errors. Never re-reads the source, so every retry sends identical bytes."""
     try:
-        # Skip token refresh - will happen automatically on auth error if needed
-        # This makes uploads much faster
-        data = _read_complete_bytes(file_path)
         md = DBX.files_upload(data, dropbox_file, mode=WriteMode.overwrite)
-        # Verify Dropbox stored exactly what we sent — guards against
-        # truncated/half-written uploads (half-grey images).
+        # Verify Dropbox stored exactly what we sent.
         if getattr(md, "size", len(data)) != len(data):
             raise RuntimeError(
                 f"Size mismatch for {dropbox_file}: sent {len(data)}, "
                 f"stored {getattr(md, 'size', '?')}")
-        return True
     except AuthError as e:
-        # Token expired - refresh and retry
+        # Token expired - refresh and retry once with the SAME bytes.
         error_str = str(e).lower()
         if 'expired' in error_str or 'expired_access_token' in error_str:
             refresh_dbx_if_needed()
-            # Retry once after refresh
-            data = _read_complete_bytes(file_path)
             md = DBX.files_upload(data, dropbox_file, mode=WriteMode.overwrite)
             if getattr(md, "size", len(data)) != len(data):
                 raise RuntimeError(
                     f"Size mismatch for {dropbox_file}: sent {len(data)}, "
                     f"stored {getattr(md, 'size', '?')}")
-            return True
+            return
         raise
     except (ApiError, RateLimitError) as e:
-        # Extract RateLimitError if nested
         rate_limit_err = _extract_rate_limit_error(e)
         if rate_limit_err:
-            log_dropbox_error("Upload Single File", e, f"File: {file_path}, Dropbox path: {dropbox_file}")
+            log_dropbox_error("Upload Single File", e, f"Dropbox path: {dropbox_file}")
             raise rate_limit_err
-        # Log ApiErrors before retry
-        log_dropbox_error("Upload Single File", e, f"File: {file_path}, Dropbox path: {dropbox_file}")
-        # Re-raise other ApiErrors to trigger retry
+        log_dropbox_error("Upload Single File", e, f"Dropbox path: {dropbox_file}")
         raise
 
 def upload_folder(local_dir: Path, dropbox_path: str, progress_callback=None, upload_delay: float = None, exclude_files: set = None) -> int:
