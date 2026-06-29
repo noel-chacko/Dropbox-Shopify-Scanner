@@ -747,10 +747,11 @@ def _wait_for_file_stable(file_path: Path, interval: float = 0.5,
 # How long to wait, total, for a file to stop changing before giving up.
 FILE_STABLE_TIMEOUT = float(os.getenv("FILE_STABLE_TIMEOUT", "60"))
 # Seconds between successive reads when checking for stability.
-FILE_STABLE_INTERVAL = float(os.getenv("FILE_STABLE_INTERVAL", "1.0"))
-# Number of consecutive byte-identical reads required to call a file "done".
-# Higher = safer against slow/paused writes, but slower.
-FILE_STABLE_MATCHES = int(os.getenv("FILE_STABLE_MATCHES", "2"))
+FILE_STABLE_INTERVAL = float(os.getenv("FILE_STABLE_INTERVAL", "0.5"))
+# Extra byte-identical reads required (beyond the first) to call a file
+# "done". 1 = a second read 0.5s later must match. Raise for more safety on
+# slow/paused writes, at the cost of speed.
+FILE_STABLE_MATCHES = int(os.getenv("FILE_STABLE_MATCHES", "1"))
 
 
 class IncompleteUploadError(Exception):
@@ -850,13 +851,20 @@ def folder_upload_ready(scan_dir: Path, exclude_files: set = None):
                 issues.append(f"{f.name}: still being written")
                 continue
             if f.suffix.lower() in (".jpg", ".jpeg", ".jpe"):
+                # Cheap marker check (head + tail only) for early feedback at
+                # Confirm; the full content-stability guard runs at upload.
                 try:
                     with open(f, "rb") as fh:
-                        data = fh.read()
+                        head = fh.read(2)
+                        try:
+                            fh.seek(-32, os.SEEK_END)
+                        except OSError:
+                            fh.seek(0)
+                        tail = fh.read()
                 except OSError:
                     issues.append(f"{f.name}: cannot read")
                     continue
-                if not _jpeg_is_complete(data):
+                if head != b"\xff\xd8" or b"\xff\xd9" not in tail:
                     issues.append(f"{f.name}: incomplete JPEG (truncated/grey)")
     except Exception as e:
         return False, [f"{scan_dir.name}: {e}"]
