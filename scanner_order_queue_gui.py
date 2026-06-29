@@ -279,6 +279,10 @@ class ScanQueueWorker(QThread):
 # Upload worker
 # ---------------------------------------------------------------------------
 
+class _UploadAborted(Exception):
+    """Raised from the progress callback to unwind an in-flight upload on quit."""
+
+
 class UploadOrderWorker(QThread):
     """Looks up an order in Shopify and uploads all its twin check folders."""
 
@@ -296,6 +300,11 @@ class UploadOrderWorker(QThread):
         self.twin_checks = list(twin_checks)
         self.scan_root = scan_root
         self.pending_tags = list(pending_tags or [])
+        self._abort = False
+
+    def abort(self):
+        """Request a cooperative stop; checked between files via the callback."""
+        self._abort = True
 
     def run(self):
         try:
@@ -328,6 +337,8 @@ class UploadOrderWorker(QThread):
             total_uploaded = 0
             failed_scans = []
             for scan_name in self.twin_checks:
+                if self._abort:
+                    return
                 scan_dir = self.scan_root / scan_name
                 if not scan_dir.exists():
                     self.scan_upload_progress.emit(
@@ -351,6 +362,8 @@ class UploadOrderWorker(QThread):
 
                 def _make_cb(sn):
                     def cb(cur, tot, msg):
+                        if self._abort:
+                            raise _UploadAborted()
                         self.scan_upload_progress.emit(self.order_input, sn, cur, tot, msg)
                     return cb
 
@@ -361,6 +374,8 @@ class UploadOrderWorker(QThread):
                         self.order_input, scan_name, uploaded, uploaded,
                         f"✅ {uploaded} files uploaded"
                     )
+                except _UploadAborted:
+                    return
                 except Exception as e:
                     failed_scans.append(scan_name)
                     self.scan_upload_progress.emit(
@@ -861,6 +876,14 @@ class ScannerOrderQueueGUI(QMainWindow):
 
     def _do_rebuild(self):
         """Clear and recreate all order group widgets, updating _order_cards."""
+        # Never tear down widgets while the user is mid-drag (or holding the
+        # mouse): a drag spins a nested event loop, so deleting the dragged
+        # DraggableScanLabel/QDrag here is a use-after-free → hard crash on
+        # macOS. Re-arm and rebuild once the button is released.
+        if QApplication.mouseButtons() & Qt.LeftButton:
+            QTimer.singleShot(100, self._do_rebuild)
+            return
+
         self._rebuild_queued = False
         self._order_cards.clear()
 
@@ -1323,10 +1346,40 @@ class ScannerOrderQueueGUI(QMainWindow):
         self._stripe.setGeometry(0, y, stripe_w, stripe_h)
 
     def closeEvent(self, event):
+        # Don't let any queued uploads start mid-shutdown.
+        self._upload_pending.clear()
+
+        # Stop the scanner loop (its longest sleep is ~5s).
         self.scanner.stop()
-        self.scanner.wait(2000)
-        for w in self._upload_workers.values():
-            w.wait(1000)
+        if not self.scanner.wait(6000):
+            self.scanner.terminate()
+            self.scanner.wait()
+
+        # Ask every upload worker to stop cooperatively FIRST, so it unwinds
+        # between files instead of being killed mid-I/O. terminate() on a
+        # thread mid-upload is the documented crash path (segfault on macOS,
+        # "QThread: Destroyed while thread is still running" everywhere).
+        workers = list(self._upload_workers.values())
+        for worker in workers:
+            worker.abort()
+
+        for worker in workers:
+            # Disconnect signals before waiting so a worker still mid-upload
+            # can't emit into widgets that are being torn down.
+            for sig in (worker.order_resolved, worker.scan_upload_started,
+                        worker.scan_upload_progress, worker.upload_completed,
+                        worker.tags_applied, worker.upload_error):
+                try:
+                    sig.disconnect()
+                except Exception:
+                    pass
+            # Abort fires from the per-file callback, so the worker exits
+            # within roughly one file's upload time. terminate() stays only as
+            # a last resort to avoid "destroyed while running".
+            if not worker.wait(20000):
+                worker.terminate()
+                worker.wait()
+
         event.accept()
 
 
