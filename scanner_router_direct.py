@@ -710,40 +710,6 @@ def _is_ready(path: Path) -> bool:
         print(f"  ❌ Error checking {path.name}: {e}")
         return False
 
-def _wait_for_file_stable(file_path: Path, interval: float = 0.5,
-                          stable_checks: int = 2, timeout: float = 60.0) -> bool:
-    """Block until a file's size and mtime stop changing.
-
-    Folder-level settle detection can fire while the scanner is still writing
-    later images in the same scan, which causes half-written files to be read
-    and uploaded (showing up as half-grey images in Dropbox). This re-checks
-    the individual file right before we read it.
-
-    Returns True once the file looks fully written, or False if it never
-    settled within `timeout` seconds (caller may still attempt the upload).
-    """
-    deadline = time.time() + timeout
-    last_size = -1
-    last_mtime = -1.0
-    stable = 0
-    while time.time() < deadline:
-        try:
-            st = file_path.stat()
-            size, mtime = st.st_size, st.st_mtime
-        except OSError:
-            time.sleep(interval)
-            continue
-        if size > 0 and size == last_size and mtime == last_mtime:
-            stable += 1
-            if stable >= stable_checks:
-                return True
-        else:
-            stable = 0
-            last_size, last_mtime = size, mtime
-        time.sleep(interval)
-    return False
-
-
 # How long to wait, total, for a file to stop changing before giving up.
 FILE_STABLE_TIMEOUT = float(os.getenv("FILE_STABLE_TIMEOUT", "60"))
 # Seconds between successive reads when checking for stability.

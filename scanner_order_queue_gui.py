@@ -147,6 +147,7 @@ class ScanQueueWorker(QThread):
         self.existing_folders: set = set()
         self.processed: set = set()                  # names already emitted
         self.pending_settles: Dict[str, float] = {}  # name -> first_seen_time
+        self._last_settling: Dict[str, tuple] = {}   # name -> (count, size_mb) last emitted
         self._lock = threading.Lock()
 
     def add_to_processed(self, scan_name: str):
@@ -175,29 +176,35 @@ class ScanQueueWorker(QThread):
 
     @staticmethod
     def _folder_stats(scan_dir: Path):
-        """Return (file_count, size_mb, latest_mtime) for a scan folder."""
-        try:
-            files = [f for f in scan_dir.rglob("*") if f.is_file()]
-            if not files:
-                return 0, 0.0, 0.0
-            size = sum(f.stat().st_size for f in files)
-            mtime = max(f.stat().st_mtime for f in files)
-            return len(files), size / 1_048_576, mtime
-        except Exception:
-            return 0, 0.0, 0.0
+        """Return (file_count, size_mb, latest_mtime) in a single directory walk.
 
-    @staticmethod
-    def _is_settled(scan_dir: Path) -> bool:
-        try:
-            if not scan_dir.exists():
-                return False
-            file_files = [f for f in scan_dir.rglob("*") if f.is_file()]
-            if not file_files:
-                return False
-            mtime = max(f.stat().st_mtime for f in file_files)
-            return (time.time() - mtime) > SETTLE_SECONDS
-        except Exception:
-            return False
+        Uses os.scandir so each file costs roughly one stat() instead of the
+        three (is_file + st_size + st_mtime) a Path.rglob approach took — much
+        cheaper over an SMB share, and it's the only walk per poll now.
+        """
+        count = 0
+        total = 0
+        latest = 0.0
+        stack = [str(scan_dir)]
+        while stack:
+            d = stack.pop()
+            try:
+                with os.scandir(d) as it:
+                    for entry in it:
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(entry.path)
+                            elif entry.is_file(follow_symlinks=False):
+                                st = entry.stat()
+                                count += 1
+                                total += st.st_size
+                                if st.st_mtime > latest:
+                                    latest = st.st_mtime
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+        return count, total / 1_048_576, latest
 
     def run(self):
         self.current_root = Path(router.get_noritsu_root())
@@ -249,22 +256,28 @@ class ScanQueueWorker(QThread):
                         self.pending_settles[name] = time.time()
                         self.status_update.emit(f"🔍 New scan: {name} — waiting to settle…")
 
-                # Check pending settles — emit live stats each loop
+                # Check pending settles — one walk each, emit stats only on change
                 for name in list(self.pending_settles.keys()):
                     with self._lock:
                         already = name in self.processed
                     if already:
                         del self.pending_settles[name]
+                        self._last_settling.pop(name, None)
                         continue
                     scan_dir = self.current_root / name
                     if not scan_dir.exists():
                         del self.pending_settles[name]
+                        self._last_settling.pop(name, None)
                         continue
-                    count, size_mb, _ = self._folder_stats(scan_dir)
-                    self.settling_update.emit(name, count, size_mb)
-                    if self._is_settled(scan_dir):
+                    count, size_mb, mtime = self._folder_stats(scan_dir)
+                    snapshot = (count, round(size_mb, 1))
+                    if self._last_settling.get(name) != snapshot:
+                        self._last_settling[name] = snapshot
+                        self.settling_update.emit(name, count, size_mb)
+                    if count > 0 and (time.time() - mtime) > SETTLE_SECONDS:
                         self.scan_settled.emit(name)
                         del self.pending_settles[name]
+                        self._last_settling.pop(name, None)
                         self.existing_folders.add(name)
 
             except Exception as e:
@@ -885,28 +898,69 @@ class ScannerOrderQueueGUI(QMainWindow):
             return
 
         self._rebuild_queued = False
-        self._order_cards.clear()
 
-        # Remove all widgets except the trailing stretch
+        # Detach all card widgets from the layout (but keep them alive so
+        # unchanged ones can be re-inserted without being recreated). The
+        # trailing stretch stays.
         while self._queue_layout.count() > 1:
-            item = self._queue_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            self._queue_layout.takeAt(0)
 
+        old_cards = self._order_cards
+        new_cards: Dict[str, "OrderGroupWidget"] = {}
         last_idx = len(self.order_queue) - 1
+
         for i, batch in enumerate(self.order_queue):
             is_active = (batch.order_input == self._active_order_input)
             has_prev = (i > 0)
             has_next = (i < last_idx)
-            card = OrderGroupWidget(batch, is_active=is_active, has_prev=has_prev, has_next=has_next)
-            card.confirm_requested.connect(self._on_confirm_order)
-            card.move_up_requested.connect(self._on_move_up)
-            card.move_down_requested.connect(self._on_move_down)
-            card.retry_requested.connect(self._on_retry_order)
-            card.drop_scan_requested.connect(self._on_drop_scan)
-            card.change_tags_requested.connect(self._on_change_tags)
-            self._order_cards[batch.order_input] = card
+            sig = self._card_signature(batch, is_active, has_prev, has_next)
+
+            card = old_cards.get(batch.order_input)
+            if card is None or getattr(card, "_sig", None) != sig:
+                # New order, or its visible content changed → (re)build this
+                # one card only. Everything else is reused untouched.
+                new_card = OrderGroupWidget(batch, is_active=is_active,
+                                            has_prev=has_prev, has_next=has_next)
+                new_card._sig = sig
+                new_card.confirm_requested.connect(self._on_confirm_order)
+                new_card.move_up_requested.connect(self._on_move_up)
+                new_card.move_down_requested.connect(self._on_move_down)
+                new_card.retry_requested.connect(self._on_retry_order)
+                new_card.drop_scan_requested.connect(self._on_drop_scan)
+                new_card.change_tags_requested.connect(self._on_change_tags)
+                if card is not None:
+                    card.deleteLater()  # replaced by the rebuilt card
+                card = new_card
+
+            new_cards[batch.order_input] = card
             self._queue_layout.insertWidget(i, card)
+
+        # Drop cards for orders that left the queue.
+        for order_input, card in old_cards.items():
+            if order_input not in new_cards:
+                card.deleteLater()
+
+        self._order_cards = new_cards
+
+    @staticmethod
+    def _card_signature(batch: "OrderBatch", is_active: bool,
+                        has_prev: bool, has_next: bool) -> tuple:
+        """Everything OrderGroupWidget._build renders. If this is unchanged,
+        the card doesn't need rebuilding. Keep in sync with _build.
+        (Live upload progress is excluded — it updates the bars in place.)"""
+        return (
+            batch.order_input,
+            batch.display_name,
+            batch.status,
+            tuple(batch.twin_checks),
+            tuple(batch.pending_tags),
+            batch.email,
+            batch.customer_name,
+            batch.error_msg,
+            is_active,
+            has_prev,
+            has_next,
+        )
 
     # ------------------------------------------------------------------
     # Slot: scan settled
