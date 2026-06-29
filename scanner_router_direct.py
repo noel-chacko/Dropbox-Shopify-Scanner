@@ -9,6 +9,7 @@ For simple 4-hour token version, use scanner_router_direct_simple_token.py
 import os
 import time
 import json
+import hashlib
 from pathlib import Path, PurePosixPath
 from datetime import datetime
 import threading
@@ -743,8 +744,13 @@ def _wait_for_file_stable(file_path: Path, interval: float = 0.5,
     return False
 
 
-JPEG_COMPLETE_TIMEOUT = float(os.getenv("JPEG_COMPLETE_TIMEOUT", "30"))
-JPEG_COMPLETE_INTERVAL = float(os.getenv("JPEG_COMPLETE_INTERVAL", "1.0"))
+# How long to wait, total, for a file to stop changing before giving up.
+FILE_STABLE_TIMEOUT = float(os.getenv("FILE_STABLE_TIMEOUT", "60"))
+# Seconds between successive reads when checking for stability.
+FILE_STABLE_INTERVAL = float(os.getenv("FILE_STABLE_INTERVAL", "1.0"))
+# Number of consecutive byte-identical reads required to call a file "done".
+# Higher = safer against slow/paused writes, but slower.
+FILE_STABLE_MATCHES = int(os.getenv("FILE_STABLE_MATCHES", "2"))
 
 
 class IncompleteUploadError(Exception):
@@ -754,34 +760,55 @@ class IncompleteUploadError(Exception):
 def _jpeg_is_complete(data: bytes) -> bool:
     """A complete JPEG starts with FFD8 and carries the FFD9 end marker near
     the end. We look in the last 32 bytes (not strictly the final two) so a
-    valid file with a little trailing padding still passes — this avoids
-    falsely rejecting good scans while still catching truncated/grey ones.
+    valid file with a little trailing padding still passes. Note: markers
+    alone are NOT enough — a still-filling file can show valid markers with an
+    incomplete (grey) middle — so this is only used together with the
+    content-stability check below.
     """
     return len(data) >= 4 and data[:2] == b"\xff\xd8" and b"\xff\xd9" in data[-32:]
 
 
 def _read_complete_bytes(file_path: Path) -> bytes:
-    """Read a file's bytes for upload.
+    """Read a file's bytes for upload, only once it has stopped changing.
 
-    For JPEGs, re-read with a fresh handle (to defeat SMB caching) until the
-    bytes form a complete image, or raise IncompleteUploadError after
-    JPEG_COMPLETE_TIMEOUT. This is the real guard against half-grey scans:
-    SMB caches size/mtime, so stat()-based checks can think a still-being-
-    written file is done — only inspecting the actual content catches it.
+    The scanner writes JPEGs onto an SMB share. SMB caches size/mtime, and a
+    file that is still being written can momentarily show valid FFD8/FFD9
+    markers while its middle is incomplete — which uploads as a half-grey
+    image. The only reliable signal that the scanner is finished is that the
+    actual file content stops changing.
+
+    We read the whole file repeatedly (fresh handle each time) and only return
+    once the bytes are identical across FILE_STABLE_MATCHES consecutive reads
+    (spaced FILE_STABLE_INTERVAL) and, for JPEGs, the markers are present.
+    Raises IncompleteUploadError if it never stabilizes within
+    FILE_STABLE_TIMEOUT, so a partial scan is refused rather than uploaded.
     """
     is_jpeg = file_path.suffix.lower() in (".jpg", ".jpeg", ".jpe")
-    deadline = time.time() + JPEG_COMPLETE_TIMEOUT
+    deadline = time.time() + FILE_STABLE_TIMEOUT
+    prev_hash = None
+    matches = 0
+    data = b""
     while True:
         with open(file_path, "rb") as f:
             data = f.read()
-        if not is_jpeg or _jpeg_is_complete(data):
-            return data
+        markers_ok = (not is_jpeg) or _jpeg_is_complete(data)
+        if len(data) > 0 and markers_ok:
+            h = hashlib.md5(data).digest()
+            if h == prev_hash:
+                matches += 1
+                if matches >= FILE_STABLE_MATCHES:
+                    return data
+            else:
+                matches = 0
+                prev_hash = h
+        else:
+            matches = 0
+            prev_hash = None
         if time.time() >= deadline:
             raise IncompleteUploadError(
-                f"{file_path.name}: incomplete JPEG after "
-                f"{JPEG_COMPLETE_TIMEOUT:.0f}s (read {len(data)} bytes, no FFD9 "
-                f"end marker) — refusing to upload a grey scan")
-        time.sleep(JPEG_COMPLETE_INTERVAL)
+                f"{file_path.name}: still changing or incomplete after "
+                f"{FILE_STABLE_TIMEOUT:.0f}s — refusing to upload a partial scan")
+        time.sleep(FILE_STABLE_INTERVAL)
 
 
 def folder_upload_ready(scan_dir: Path, exclude_files: set = None):
@@ -915,15 +942,10 @@ def upload_folder(local_dir: Path, dropbox_path: str, progress_callback=None, up
         for idx, (file_path, dropbox_file) in enumerate(files_to_upload):
             try:
                 if progress_callback:
-                    progress_callback(idx, total_files, f"Verifying {file_path.name}...")
-                # Guard against uploading a half-written scan (half-grey images)
-                if not _wait_for_file_stable(file_path):
-                    warn = f"⚠️  {file_path.name} still changing after wait — uploading anyway"
-                    print(warn)
-                    if progress_callback:
-                        progress_callback(idx, total_files, warn)
-                if progress_callback:
                     progress_callback(idx, total_files, f"Uploading {file_path.name}...")
+                # _upload_single_file waits (via _read_complete_bytes) for the
+                # file's content to stop changing before sending it, so a
+                # half-written/grey scan is never uploaded.
                 if _upload_single_file(file_path, dropbox_file):
                     count += 1
                     # Add delay after successful upload to prevent rate limiting
