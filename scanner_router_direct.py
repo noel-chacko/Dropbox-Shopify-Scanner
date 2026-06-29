@@ -789,10 +789,18 @@ def _read_complete_bytes(file_path: Path) -> bytes:
     matches = 0
     data = b""
     while True:
+        try:
+            disk_size = file_path.stat().st_size
+        except OSError:
+            disk_size = -1
         with open(file_path, "rb") as f:
             data = f.read()
+        # Bytes read must match the file's reported size — guards against a
+        # short read returning only part of the image (which would upload as
+        # a grey/incomplete file).
+        size_ok = (len(data) == disk_size)
         markers_ok = (not is_jpeg) or _jpeg_is_complete(data)
-        if len(data) > 0 and markers_ok:
+        if len(data) > 0 and size_ok and markers_ok:
             h = hashlib.md5(data).digest()
             if h == prev_hash:
                 matches += 1
