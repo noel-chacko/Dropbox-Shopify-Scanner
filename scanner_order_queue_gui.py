@@ -326,6 +326,7 @@ class UploadOrderWorker(QThread):
 
             # --- Upload twin checks ---
             total_uploaded = 0
+            failed_scans = []
             for scan_name in self.twin_checks:
                 scan_dir = self.scan_root / scan_name
                 if not scan_dir.exists():
@@ -354,16 +355,27 @@ class UploadOrderWorker(QThread):
                     return cb
 
                 try:
-                    uploaded = router.upload_folder(scan_dir, dest, _make_cb(scan_name), upload_delay=2.0, exclude_files={"thumbs.db"})
+                    uploaded = router.upload_folder(scan_dir, dest, _make_cb(scan_name), upload_delay=0.5, exclude_files={"thumbs.db"})
                     total_uploaded += uploaded
                     self.scan_upload_progress.emit(
                         self.order_input, scan_name, uploaded, uploaded,
                         f"✅ {uploaded} files uploaded"
                     )
                 except Exception as e:
+                    failed_scans.append(scan_name)
                     self.scan_upload_progress.emit(
                         self.order_input, scan_name, 0, 0, f"❌ {e}"
                     )
+
+            # If any scan was refused (e.g. a truncated/grey JPEG), fail the
+            # whole order loudly so it shows an error + Retry, rather than
+            # silently completing with missing or half-uploaded scans.
+            if failed_scans:
+                self.upload_error.emit(
+                    self.order_input,
+                    "Some scans were not fully uploaded (incomplete/grey files "
+                    f"refused): {', '.join(failed_scans)}. Rescan if needed, then Retry.")
+                return
 
             # --- Apply Shopify tags if any were specified ---
             if self.pending_tags and order_gid:

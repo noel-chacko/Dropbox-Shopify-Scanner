@@ -743,13 +743,54 @@ def _wait_for_file_stable(file_path: Path, interval: float = 0.5,
     return False
 
 
+JPEG_COMPLETE_TIMEOUT = float(os.getenv("JPEG_COMPLETE_TIMEOUT", "30"))
+JPEG_COMPLETE_INTERVAL = float(os.getenv("JPEG_COMPLETE_INTERVAL", "1.0"))
+
+
+class IncompleteUploadError(Exception):
+    """Raised when a file is not a complete image and must not be uploaded."""
+
+
+def _jpeg_is_complete(data: bytes) -> bool:
+    """A complete JPEG starts with FFD8 and carries the FFD9 end marker near
+    the end. We look in the last 32 bytes (not strictly the final two) so a
+    valid file with a little trailing padding still passes — this avoids
+    falsely rejecting good scans while still catching truncated/grey ones.
+    """
+    return len(data) >= 4 and data[:2] == b"\xff\xd8" and b"\xff\xd9" in data[-32:]
+
+
+def _read_complete_bytes(file_path: Path) -> bytes:
+    """Read a file's bytes for upload.
+
+    For JPEGs, re-read with a fresh handle (to defeat SMB caching) until the
+    bytes form a complete image, or raise IncompleteUploadError after
+    JPEG_COMPLETE_TIMEOUT. This is the real guard against half-grey scans:
+    SMB caches size/mtime, so stat()-based checks can think a still-being-
+    written file is done — only inspecting the actual content catches it.
+    """
+    is_jpeg = file_path.suffix.lower() in (".jpg", ".jpeg", ".jpe")
+    deadline = time.time() + JPEG_COMPLETE_TIMEOUT
+    while True:
+        with open(file_path, "rb") as f:
+            data = f.read()
+        if not is_jpeg or _jpeg_is_complete(data):
+            return data
+        if time.time() >= deadline:
+            raise IncompleteUploadError(
+                f"{file_path.name}: incomplete JPEG after "
+                f"{JPEG_COMPLETE_TIMEOUT:.0f}s (read {len(data)} bytes, no FFD9 "
+                f"end marker) — refusing to upload a grey scan")
+        time.sleep(JPEG_COMPLETE_INTERVAL)
+
+
 def folder_upload_ready(scan_dir: Path, exclude_files: set = None):
     """Check whether every file in a scan folder is safe to upload.
 
-    A folder is ready only when each file is non-empty and has stopped
-    changing (last write older than SETTLE_SECONDS). Returns
-    (ready: bool, issues: list[str]). Used to gate the Confirm Upload button
-    so still-being-written scans are not uploaded.
+    A folder is ready only when each file is non-empty, has stopped changing
+    (last write older than SETTLE_SECONDS), and — for JPEGs — is a complete
+    image (FFD8/FFD9). Returns (ready: bool, issues: list[str]). Used to gate
+    the Confirm Upload button so still-being-written scans are not uploaded.
     """
     issues = []
     _excluded = {n.lower() for n in (exclude_files or {"thumbs.db"})}
@@ -773,6 +814,15 @@ def folder_upload_ready(scan_dir: Path, exclude_files: set = None):
             if now - st.st_mtime < SETTLE_SECONDS:
                 issues.append(f"{f.name}: still being written")
                 continue
+            if f.suffix.lower() in (".jpg", ".jpeg", ".jpe"):
+                try:
+                    with open(f, "rb") as fh:
+                        data = fh.read()
+                except OSError:
+                    issues.append(f"{f.name}: cannot read")
+                    continue
+                if not _jpeg_is_complete(data):
+                    issues.append(f"{f.name}: incomplete JPEG (truncated/grey)")
     except Exception as e:
         return False, [f"{scan_dir.name}: {e}"]
     return (len(issues) == 0), issues
@@ -784,8 +834,7 @@ def _upload_single_file(file_path: Path, dropbox_file: str) -> bool:
     try:
         # Skip token refresh - will happen automatically on auth error if needed
         # This makes uploads much faster
-        with open(file_path, "rb") as f:
-            data = f.read()
+        data = _read_complete_bytes(file_path)
         md = DBX.files_upload(data, dropbox_file, mode=WriteMode.overwrite)
         # Verify Dropbox stored exactly what we sent — guards against
         # truncated/half-written uploads (half-grey images).
@@ -800,8 +849,7 @@ def _upload_single_file(file_path: Path, dropbox_file: str) -> bool:
         if 'expired' in error_str or 'expired_access_token' in error_str:
             refresh_dbx_if_needed()
             # Retry once after refresh
-            with open(file_path, "rb") as f:
-                data = f.read()
+            data = _read_complete_bytes(file_path)
             md = DBX.files_upload(data, dropbox_file, mode=WriteMode.overwrite)
             if getattr(md, "size", len(data)) != len(data):
                 raise RuntimeError(
@@ -882,6 +930,10 @@ def upload_folder(local_dir: Path, dropbox_path: str, progress_callback=None, up
                     # Skip delay on last file to finish faster
                     if idx < len(files_to_upload) - 1:
                         time.sleep(UPLOAD_DELAY)
+            except IncompleteUploadError:
+                # Never upload a truncated/grey scan — abort this folder loudly
+                # so the caller can mark the order failed and offer a retry.
+                raise
             except (RateLimitError, ApiError, AuthError) as e:
                 # Extract rate limit error details
                 rate_limit_err = _extract_rate_limit_error(e)
