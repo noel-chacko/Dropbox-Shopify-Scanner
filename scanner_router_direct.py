@@ -735,6 +735,19 @@ def _jpeg_is_complete(data: bytes) -> bool:
     return len(data) >= 4 and data[:2] == b"\xff\xd8" and b"\xff\xd9" in data[-32:]
 
 
+# A pre-allocated JPEG whose image body hasn't been written yet contains a
+# large run of NUL bytes (the unwritten/sparse region renders grey). Valid
+# JPEG entropy data never contains a long literal zero run, so this is an
+# unambiguous "body not filled yet" signal — independent of size/mtime/cache.
+ZERO_GAP_BYTES = int(os.getenv("ZERO_GAP_BYTES", "4096"))
+
+
+def _has_unfilled_body(data: bytes) -> bool:
+    """True if data has a long run of NUL bytes — the signature of a
+    pre-allocated scan whose body the scanner hasn't written yet (grey)."""
+    return (b"\x00" * ZERO_GAP_BYTES) in data
+
+
 def _read_complete_bytes(file_path: Path) -> bytes:
     """Read a file's bytes for upload, only once it has stopped changing.
 
@@ -774,7 +787,10 @@ def _read_complete_bytes(file_path: Path) -> bytes:
         size_ok = (len(data) == disk_size)
         mtime_ok = (mtime > 0) and (time.time() - mtime > SETTLE_SECONDS)
         markers_ok = (not is_jpeg) or _jpeg_is_complete(data)
-        if len(data) > 0 and size_ok and mtime_ok and markers_ok:
+        # Reject a pre-allocated file whose image body is still unwritten
+        # (large NUL run) — the actual cause of the grey frames.
+        body_ok = not _has_unfilled_body(data)
+        if len(data) > 0 and size_ok and mtime_ok and markers_ok and body_ok:
             h = hashlib.md5(data).digest()
             if h == prev_hash:
                 matches += 1
@@ -792,7 +808,8 @@ def _read_complete_bytes(file_path: Path) -> bytes:
                 f"{file_path.name}: still changing or incomplete after "
                 f"{FILE_STABLE_TIMEOUT:.0f}s (size_ok={size_ok}, "
                 f"mtime_ok={mtime_ok}, markers_ok={markers_ok}, "
-                f"read={len(data)}/{disk_size}) — refusing to upload a partial scan")
+                f"body_ok={body_ok}, read={len(data)}/{disk_size}) "
+                f"— refusing to upload a partial scan")
         time.sleep(FILE_STABLE_INTERVAL)
 
 
