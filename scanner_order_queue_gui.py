@@ -1086,9 +1086,26 @@ class ScannerOrderQueueGUI(QMainWindow):
             worker.upload_completed.connect(self._on_upload_completed)
             worker.tags_applied.connect(self._on_tags_applied)
             worker.upload_error.connect(self._on_upload_error)
+            # Reap only via finished (queued to the main thread after run()
+            # returns) — dropping the last Python reference from the
+            # completed/error slots destroys the QThread from inside its own
+            # still-running thread (qFatal/SIGABRT on macOS).
+            worker.finished.connect(
+                lambda oi=order_input, w=worker: self._reap_upload_worker(oi, w))
             self._upload_workers[order_input] = worker
             worker.start()
             return
+
+    def _reap_upload_worker(self, order_input: str, worker: "UploadOrderWorker"):
+        """Drop our reference to a finished upload worker (main thread).
+
+        wait() here is effectively instant — finished has already fired — but
+        it guarantees the thread is fully stopped before the last Python
+        reference goes away, so the QThread destructor can never run while the
+        thread is still winding down."""
+        worker.wait(5000)
+        if self._upload_workers.get(order_input) is worker:
+            self._upload_workers.pop(order_input, None)
 
     # ------------------------------------------------------------------
     # Slot: move twin check down to next order
@@ -1200,7 +1217,8 @@ class ScannerOrderQueueGUI(QMainWindow):
         if batch:
             batch.status = "completed"
             batch.progress = {}
-        self._upload_workers.pop(order_input, None)
+        # Worker reference is released in _reap_upload_worker (on finished) —
+        # popping it here races the thread's own teardown and segfaults.
         if self._upload_active == order_input:
             self._upload_active = None
         self._log(f"✅ Upload complete for {order_input}: {total_files} files total", "SUCCESS")
@@ -1214,7 +1232,7 @@ class ScannerOrderQueueGUI(QMainWindow):
             lines = error_msg.strip().splitlines()
             batch.error_msg = lines[-1] if lines else "Unknown error"
             batch.error_detail = error_msg  # full traceback available via tooltip
-        self._upload_workers.pop(order_input, None)
+        # Worker reference is released in _reap_upload_worker (on finished).
         if self._upload_active == order_input:
             self._upload_active = None
         short = batch.error_msg if batch else error_msg
