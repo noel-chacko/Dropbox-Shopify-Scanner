@@ -539,7 +539,9 @@ class OrderGroupWidget(QFrame):
             if self.batch.status == "pending" and self.batch.order_input != UNASSIGNED:
                 edit_btn = QPushButton("✎")
                 edit_btn.setFixedSize(22, 22)
-                edit_btn.setFont(QFont("Arial", 9))
+                edit_btn.setStyleSheet(
+                    "QPushButton { padding: 0px; min-height: 0px; "
+                    "font-size: 13px; font-weight: bold; }")
                 edit_btn.setToolTip("Edit tags")
                 edit_btn.clicked.connect(
                     lambda: self.change_tags_requested.emit(self.batch.order_input)
@@ -605,9 +607,17 @@ class OrderGroupWidget(QFrame):
                 self._progress_labels[scan_name] = prog_lbl
                 row.addWidget(prog_lbl)
 
-                up_btn = QPushButton("↑")
-                up_btn.setFixedSize(28, 26)
-                up_btn.setFont(QFont("Arial", 9))
+                # The global QPushButton style forces 15px side padding, which
+                # is wider than these 28px buttons — it squeezes the arrow glyph
+                # out of view. Zero the padding locally so ↑/↓ actually render.
+                arrow_style = (
+                    "QPushButton { padding: 0px; min-height: 0px; "
+                    "font-size: 14px; font-weight: bold; }"
+                )
+
+                up_btn = QPushButton("▲")
+                up_btn.setFixedSize(30, 28)
+                up_btn.setStyleSheet(arrow_style)
                 up_btn.setEnabled(can_move_up)
                 up_btn.setToolTip("Move to previous order")
                 up_btn.clicked.connect(
@@ -615,9 +625,9 @@ class OrderGroupWidget(QFrame):
                 )
                 row.addWidget(up_btn)
 
-                down_btn = QPushButton("↓")
-                down_btn.setFixedSize(28, 26)
-                down_btn.setFont(QFont("Arial", 9))
+                down_btn = QPushButton("▼")
+                down_btn.setFixedSize(30, 28)
+                down_btn.setStyleSheet(arrow_style)
                 down_btn.setEnabled(can_move_down)
                 down_btn.setToolTip("Move to next order")
                 down_btn.clicked.connect(
