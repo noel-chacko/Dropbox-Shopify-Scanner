@@ -718,6 +718,11 @@ FILE_STABLE_INTERVAL = float(os.getenv("FILE_STABLE_INTERVAL", "0.5"))
 # "done". 1 = a second read 0.5s later must match. Raise for more safety on
 # slow/paused writes, at the cost of speed.
 FILE_STABLE_MATCHES = int(os.getenv("FILE_STABLE_MATCHES", "1"))
+# A file untouched for this many seconds is accepted after ONE clean read
+# (all content checks still apply) — the re-read confirmation only guards
+# against a write happening right now, which a minutes-old mtime rules out.
+# Raise to a huge value to force the double-read for every file.
+FILE_STABLE_SKIP_AGE = float(os.getenv("FILE_STABLE_SKIP_AGE", "30"))
 
 
 class IncompleteUploadError(Exception):
@@ -791,11 +796,19 @@ def _read_complete_bytes(file_path: Path) -> bytes:
         # (large NUL run) — the actual cause of the grey frames.
         body_ok = not _has_unfilled_body(data)
         if len(data) > 0 and size_ok and mtime_ok and markers_ok and body_ok:
+            age = time.time() - mtime
+            # Fast path: a file whose last write is minutes old cannot be
+            # mid-write, so one read that passes every content check (size,
+            # markers, no unwritten body) is as good as two. Saves a full
+            # SMB re-read + 0.5s sleep per file on settled scans.
+            if age > FILE_STABLE_SKIP_AGE:
+                _log_upload_read(file_path, len(data), age, iterations)
+                return data
             h = hashlib.md5(data).digest()
             if h == prev_hash:
                 matches += 1
                 if matches >= FILE_STABLE_MATCHES:
-                    _log_upload_read(file_path, len(data), time.time() - mtime, iterations)
+                    _log_upload_read(file_path, len(data), age, iterations)
                     return data
             else:
                 matches = 0
@@ -997,6 +1010,7 @@ def upload_folder(local_dir: Path, dropbox_path: str, progress_callback=None, up
         
         # Upload files sequentially with delay to prevent rate limits
         for idx, (file_path, dropbox_file) in enumerate(files_to_upload):
+            cycle_start = time.time()
             try:
                 if progress_callback:
                     progress_callback(idx, total_files, f"Uploading {file_path.name}...")
@@ -1005,10 +1019,14 @@ def upload_folder(local_dir: Path, dropbox_path: str, progress_callback=None, up
                 # half-written/grey scan is never uploaded.
                 if _upload_single_file(file_path, dropbox_file):
                     count += 1
-                    # Add delay after successful upload to prevent rate limiting
-                    # Skip delay on last file to finish faster
+                    # Space write requests UPLOAD_DELAY apart to prevent rate
+                    # limiting — but credit the time this file already took
+                    # (read + upload), which usually covers it entirely.
+                    # Skip on the last file to finish faster.
                     if idx < len(files_to_upload) - 1:
-                        time.sleep(UPLOAD_DELAY)
+                        remaining = UPLOAD_DELAY - (time.time() - cycle_start)
+                        if remaining > 0:
+                            time.sleep(remaining)
             except IncompleteUploadError:
                 # Never upload a truncated/grey scan — abort this folder loudly
                 # so the caller can mark the order failed and offer a retry.
