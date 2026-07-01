@@ -389,6 +389,17 @@ class UploadOrderWorker(QThread):
                     )
                 except _UploadAborted:
                     return
+                except (router.IncompleteUploadError,
+                        router.UploadVerificationError) as e:
+                    # A grey/incomplete file — either the local scan never
+                    # passed the completeness checks, or Dropbox kept a
+                    # truncated copy that retries couldn't fix. Loud and
+                    # unambiguous so staff rescans before the customer sees it.
+                    failed_scans.append(scan_name)
+                    self.scan_upload_progress.emit(
+                        self.order_input, scan_name, 0, 0,
+                        f"❌ GREY ROLL {scan_name}: upload blocked — {e}"
+                    )
                 except Exception as e:
                     failed_scans.append(scan_name)
                     self.scan_upload_progress.emit(

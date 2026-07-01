@@ -913,15 +913,24 @@ def _dropbox_content_hash(data: bytes) -> str:
     return hashlib.sha256(digests).hexdigest()
 
 
+# Running count of truncated/corrupted commits _verify_uploaded caught (each
+# is retried with the same bytes). upload_folder samples it around each file
+# so the GUI can show a warning when a would-be-grey upload was repaired.
+VERIFICATION_FAILURES = 0
+
+
 def _verify_uploaded(md, data: bytes, dropbox_file: str) -> None:
     """Check the FileMetadata Dropbox returned against the bytes we sent."""
+    global VERIFICATION_FAILURES
     stored_size = getattr(md, "size", None)
     if stored_size is not None and stored_size != len(data):
+        VERIFICATION_FAILURES += 1
         raise UploadVerificationError(
             f"Dropbox stored {stored_size} of {len(data)} bytes for "
             f"{dropbox_file} (truncated in transit)")
     stored_hash = getattr(md, "content_hash", None)
     if stored_hash and stored_hash != _dropbox_content_hash(data):
+        VERIFICATION_FAILURES += 1
         raise UploadVerificationError(
             f"Dropbox content-hash mismatch for {dropbox_file} "
             f"(corrupted in transit)")
@@ -1017,7 +1026,13 @@ def upload_folder(local_dir: Path, dropbox_path: str, progress_callback=None, up
                 # _upload_single_file waits (via _read_complete_bytes) for the
                 # file's content to stop changing before sending it, so a
                 # half-written/grey scan is never uploaded.
+                failures_before = VERIFICATION_FAILURES
                 if _upload_single_file(file_path, dropbox_file):
+                    if VERIFICATION_FAILURES > failures_before and progress_callback:
+                        progress_callback(
+                            idx, total_files,
+                            f"⚠️ {file_path.name}: Dropbox kept a truncated "
+                            f"(grey) copy — caught and re-sent OK")
                     count += 1
                     # Space write requests UPLOAD_DELAY apart to prevent rate
                     # limiting — but credit the time this file already took
@@ -1148,13 +1163,17 @@ def upload_folder(local_dir: Path, dropbox_path: str, progress_callback=None, up
         if progress_callback:
             progress_callback(total_files, total_files, f"✅ Uploaded {count} files")
                 
+    except (IncompleteUploadError, UploadVerificationError):
+        # Grey/truncated scan — must reach the caller so the order is marked
+        # failed with a Retry, not swallowed into a "partial success" count.
+        raise
     except Exception as e:
         error_msg = f"❌ Error processing folder {local_dir}: {e}"
         print(error_msg)
         log_dropbox_error("Upload Folder (Exception)", e, f"Folder: {local_dir}, Dropbox path: {dropbox_path}")
         if progress_callback:
             progress_callback(0, 0, error_msg)
-    
+
     return count
 
 def set_order_gui(order_num_raw: str, tags: Optional[List[str]] = None) -> bool:
@@ -1454,8 +1473,19 @@ def process_scan(scan_dir: Path) -> None:
                 gui_callbacks['upload_progress'](scan_name, current, total, message)
             progress_cb = progress
         
-        uploaded = upload_folder(scan_dir, dest, progress_cb)
-        
+        try:
+            uploaded = upload_folder(scan_dir, dest, progress_cb)
+        except (IncompleteUploadError, UploadVerificationError) as e:
+            # Grey/incomplete scan — refuse loudly, don't mark processed so it
+            # is retried once the scan finishes writing (or is rescanned).
+            error_msg = f"❌ GREY/INCOMPLETE SCAN {scan_name}: upload blocked — {e}"
+            print(error_msg)
+            if progress_cb:
+                progress_cb(0, 0, error_msg)
+            if gui_callbacks['error']:
+                gui_callbacks['error'](scan_name, error_msg)
+            return
+
         # Check if upload was successful (some files uploaded) or completely failed
         if uploaded == 0:
             error_msg = f"⚠️  No files uploaded for {scan_name}. Check logs for details."
