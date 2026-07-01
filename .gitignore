@@ -54,3 +54,10 @@ Thumbs.db
 # Project specific
 .processed_jobs.json
 *.log
+
+# Credentials — never commit (rotate if ever exposed)
+.dropbox_tokens.json
+
+# Incident reports containing customer emails
+affected_grey_files.txt
+affected_grey_files_by_severity.txt
