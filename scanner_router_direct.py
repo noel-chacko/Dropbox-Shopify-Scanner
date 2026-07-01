@@ -884,6 +884,36 @@ def folder_upload_ready(scan_dir: Path, exclude_files: set = None):
     return (len(issues) == 0), issues
 
 
+class UploadVerificationError(Exception):
+    """Dropbox committed fewer/different bytes than we sent — in practice a
+    connection drop mid-transfer, which Dropbox commits truncated at a 16 KiB
+    boundary (the half-grey files). Retryable: re-sending the same bytes
+    overwrites the truncated copy."""
+
+
+def _dropbox_content_hash(data: bytes) -> str:
+    """Dropbox content_hash: sha256 of the concatenated sha256s of each
+    4 MiB block. Lets us verify the stored bytes, not just the stored size."""
+    block = 4 * 1024 * 1024
+    digests = b"".join(hashlib.sha256(data[i:i + block]).digest()
+                       for i in range(0, len(data), block))
+    return hashlib.sha256(digests).hexdigest()
+
+
+def _verify_uploaded(md, data: bytes, dropbox_file: str) -> None:
+    """Check the FileMetadata Dropbox returned against the bytes we sent."""
+    stored_size = getattr(md, "size", None)
+    if stored_size is not None and stored_size != len(data):
+        raise UploadVerificationError(
+            f"Dropbox stored {stored_size} of {len(data)} bytes for "
+            f"{dropbox_file} (truncated in transit)")
+    stored_hash = getattr(md, "content_hash", None)
+    if stored_hash and stored_hash != _dropbox_content_hash(data):
+        raise UploadVerificationError(
+            f"Dropbox content-hash mismatch for {dropbox_file} "
+            f"(corrupted in transit)")
+
+
 def _upload_single_file(file_path: Path, dropbox_file: str) -> bool:
     """Read a file's verified-complete bytes ONCE, then upload them.
 
@@ -896,27 +926,22 @@ def _upload_single_file(file_path: Path, dropbox_file: str) -> bool:
     return True
 
 
-@retry(wait=wait_exponential(multiplier=2, min=2, max=60), stop=stop_after_attempt(5), retry=retry_if_exception_type((RateLimitError, ApiError, AuthError)))
+@retry(wait=wait_exponential(multiplier=2, min=2, max=60), stop=stop_after_attempt(5), reraise=True, retry=retry_if_exception_type((RateLimitError, ApiError, AuthError, UploadVerificationError)))
 def _upload_bytes(data: bytes, dropbox_file: str) -> None:
     """Upload already-read bytes to Dropbox, retrying transient/rate-limit
-    errors. Never re-reads the source, so every retry sends identical bytes."""
+    errors AND truncated/corrupted commits (size or content-hash mismatch —
+    the half-grey files). Never re-reads the source, so every retry sends
+    identical bytes."""
     try:
         md = DBX.files_upload(data, dropbox_file, mode=WriteMode.overwrite)
-        # Verify Dropbox stored exactly what we sent.
-        if getattr(md, "size", len(data)) != len(data):
-            raise RuntimeError(
-                f"Size mismatch for {dropbox_file}: sent {len(data)}, "
-                f"stored {getattr(md, 'size', '?')}")
+        _verify_uploaded(md, data, dropbox_file)
     except AuthError as e:
         # Token expired - refresh and retry once with the SAME bytes.
         error_str = str(e).lower()
         if 'expired' in error_str or 'expired_access_token' in error_str:
             refresh_dbx_if_needed()
             md = DBX.files_upload(data, dropbox_file, mode=WriteMode.overwrite)
-            if getattr(md, "size", len(data)) != len(data):
-                raise RuntimeError(
-                    f"Size mismatch for {dropbox_file}: sent {len(data)}, "
-                    f"stored {getattr(md, 'size', '?')}")
+            _verify_uploaded(md, data, dropbox_file)
             return
         raise
     except (ApiError, RateLimitError) as e:
@@ -987,6 +1012,11 @@ def upload_folder(local_dir: Path, dropbox_path: str, progress_callback=None, up
             except IncompleteUploadError:
                 # Never upload a truncated/grey scan — abort this folder loudly
                 # so the caller can mark the order failed and offer a retry.
+                raise
+            except UploadVerificationError:
+                # Dropbox holds a truncated copy and 5 re-sends couldn't fix
+                # it — abort loudly so the order shows an error + Retry
+                # instead of completing with a half-grey file on Dropbox.
                 raise
             except (RateLimitError, ApiError, AuthError) as e:
                 # Extract rate limit error details
