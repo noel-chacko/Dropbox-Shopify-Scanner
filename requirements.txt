@@ -1,5 +1,8 @@
 watchdog==5.0.3
 dropbox==11.36.2
+# dropbox 11.x imports pkg_resources, which fresh venvs on Python 3.12+ lack
+# and newer setuptools releases drop.
+setuptools<81
 python-dotenv==1.0.1
 tenacity==9.0.0
 requests==2.32.3

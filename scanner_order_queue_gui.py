@@ -10,6 +10,7 @@ import sys
 import os
 import re
 import time
+import itertools
 import threading
 import traceback
 from pathlib import Path
@@ -95,8 +96,16 @@ class StripeWidget(QWidget):
 class OrderBatch:
     """One order and its associated twin check folder names."""
 
+    # The same order number can legitimately appear twice in one day (late
+    # rolls for an already-completed order), so identity must NOT be the
+    # order number: cards, workers, and the upload queue are keyed by this
+    # unique per-batch key instead.
+    _key_counter = itertools.count(1)
+
     def __init__(self, order_input: str):
         self.order_input: str = order_input          # exactly what the user typed
+        self.key: str = (order_input if order_input == UNASSIGNED
+                         else f"{order_input}#{next(OrderBatch._key_counter)}")
 
         # Parse "343432s" → number "343432", tags ["s"]
         m = re.match(r"^#?(\d+)(.*)$", order_input)
@@ -292,10 +301,6 @@ class ScanQueueWorker(QThread):
 # Upload worker
 # ---------------------------------------------------------------------------
 
-class _UploadAborted(Exception):
-    """Raised from the progress callback to unwind an in-flight upload on quit."""
-
-
 class UploadOrderWorker(QThread):
     """Looks up an order in Shopify and uploads all its twin check folders."""
 
@@ -307,9 +312,12 @@ class UploadOrderWorker(QThread):
     upload_error = Signal(str, str)                   # order_input, error_msg
 
     def __init__(self, order_input: str, twin_checks: List[str], scan_root: Path,
-                 pending_tags: List[str] = None):
+                 pending_tags: List[str] = None, key: str = None):
         super().__init__()
-        self.order_input = order_input
+        # Signals echo the batch's unique key so the GUI updates the right
+        # batch even when the same order number is queued twice.
+        self.order_input = key or order_input
+        self.shopify_input = order_input   # what the user typed — parsed for the lookup
         self.twin_checks = list(twin_checks)
         self.scan_root = scan_root
         self.pending_tags = list(pending_tags or [])
@@ -322,14 +330,14 @@ class UploadOrderWorker(QThread):
     def run(self):
         try:
             # --- Shopify lookup ---
-            order_num = self.order_input
-            m = re.match(r"^#?(\d+)(.*)$", self.order_input)
+            order_num = self.shopify_input
+            m = re.match(r"^#?(\d+)(.*)$", self.shopify_input)
             if m:
                 order_num = m.group(1)
 
             results = router.shopify_search_orders(f"name:{order_num}")
             if not results:
-                self.upload_error.emit(self.order_input, f"Order not found: {self.order_input}")
+                self.upload_error.emit(self.order_input, f"Order not found: {self.shopify_input}")
                 return
 
             order_node = results[0]
@@ -375,19 +383,24 @@ class UploadOrderWorker(QThread):
 
                 def _make_cb(sn):
                     def cb(cur, tot, msg):
-                        if self._abort:
-                            raise _UploadAborted()
                         self.scan_upload_progress.emit(self.order_input, sn, cur, tot, msg)
                     return cb
 
                 try:
-                    uploaded = router.upload_folder(scan_dir, dest, _make_cb(scan_name), upload_delay=0.5, exclude_files={"thumbs.db"})
+                    # Batch-session upload: streams files a few at a time,
+                    # then commits the whole scan as ONE Dropbox write op —
+                    # no per-file pacing, no write-op rate limiting.
+                    uploaded = router.batch_upload_folder(
+                        scan_dir, dest,
+                        progress_callback=_make_cb(scan_name),
+                        abort_check=lambda: self._abort,
+                        exclude_files={"thumbs.db"})
                     total_uploaded += uploaded
                     self.scan_upload_progress.emit(
                         self.order_input, scan_name, uploaded, uploaded,
                         f"✅ {uploaded} files uploaded"
                     )
-                except _UploadAborted:
+                except router.UploadAborted:
                     return
                 except (router.IncompleteUploadError,
                         router.UploadVerificationError) as e:
@@ -555,7 +568,7 @@ class OrderGroupWidget(QFrame):
                     "font-size: 13px; font-weight: bold; }")
                 edit_btn.setToolTip("Edit tags")
                 edit_btn.clicked.connect(
-                    lambda: self.change_tags_requested.emit(self.batch.order_input)
+                    lambda: self.change_tags_requested.emit(self.batch.key)
                 )
                 header_row.addWidget(edit_btn)
 
@@ -593,7 +606,7 @@ class OrderGroupWidget(QFrame):
             for scan_name in self.batch.twin_checks:
                 row = QHBoxLayout()
 
-                name_lbl = DraggableScanLabel(scan_name, self.batch.order_input)
+                name_lbl = DraggableScanLabel(scan_name, self.batch.key)
                 row.addWidget(name_lbl, stretch=1)
 
                 # Per-scan progress bar — only meaningful while uploading
@@ -632,7 +645,7 @@ class OrderGroupWidget(QFrame):
                 up_btn.setEnabled(can_move_up)
                 up_btn.setToolTip("Move to previous order")
                 up_btn.clicked.connect(
-                    (lambda sn: lambda: self.move_up_requested.emit(self.batch.order_input, sn))(scan_name)
+                    (lambda sn: lambda: self.move_up_requested.emit(self.batch.key, sn))(scan_name)
                 )
                 row.addWidget(up_btn)
 
@@ -642,7 +655,7 @@ class OrderGroupWidget(QFrame):
                 down_btn.setEnabled(can_move_down)
                 down_btn.setToolTip("Move to next order")
                 down_btn.clicked.connect(
-                    (lambda sn: lambda: self.move_down_requested.emit(self.batch.order_input, sn))(scan_name)
+                    (lambda sn: lambda: self.move_down_requested.emit(self.batch.key, sn))(scan_name)
                 )
                 row.addWidget(down_btn)
 
@@ -665,7 +678,7 @@ class OrderGroupWidget(QFrame):
                 confirm_btn.setMinimumHeight(36)
                 confirm_btn.setEnabled(bool(self.batch.twin_checks))
                 confirm_btn.clicked.connect(
-                    lambda: self.confirm_requested.emit(self.batch.order_input)
+                    lambda: self.confirm_requested.emit(self.batch.key)
                 )
                 root.addWidget(confirm_btn)
 
@@ -684,7 +697,7 @@ class OrderGroupWidget(QFrame):
                 retry_btn = QPushButton("Retry Upload")
                 retry_btn.setMinimumHeight(36)
                 retry_btn.clicked.connect(
-                    lambda: self.retry_requested.emit(self.batch.order_input)
+                    lambda: self.retry_requested.emit(self.batch.key)
                 )
                 root.addWidget(retry_btn)
 
@@ -715,8 +728,8 @@ class OrderGroupWidget(QFrame):
             return
         payload = event.mimeData().data(DraggableScanLabel.MIME_TYPE).data().decode()
         src_order, scan_name = payload.split("\n", 1)
-        if src_order != self.batch.order_input:
-            self.drop_scan_requested.emit(src_order, scan_name, self.batch.order_input)
+        if src_order != self.batch.key:
+            self.drop_scan_requested.emit(src_order, scan_name, self.batch.key)
         event.acceptProposedAction()
 
 
@@ -919,7 +932,19 @@ class ScannerOrderQueueGUI(QMainWindow):
             return
 
         self._rebuild_queued = False
+        try:
+            self._do_rebuild_inner()
+        except Exception:
+            # A failed redraw must never leave the panel stripped for the
+            # rest of the session — log it and try again on the next tick.
+            err = traceback.format_exc()
+            print(err)
+            try:
+                self._log(f"Queue redraw failed: {err.strip().splitlines()[-1]}", "ERROR")
+            except Exception:
+                pass
 
+    def _do_rebuild_inner(self):
         # Detach all card widgets from the layout (but keep them alive so
         # unchanged ones can be re-inserted without being recreated). The
         # trailing stretch stays.
@@ -931,12 +956,12 @@ class ScannerOrderQueueGUI(QMainWindow):
         last_idx = len(self.order_queue) - 1
 
         for i, batch in enumerate(self.order_queue):
-            is_active = (batch.order_input == self._active_order_input)
+            is_active = (batch.key == self._active_order_input)
             has_prev = (i > 0)
             has_next = (i < last_idx)
             sig = self._card_signature(batch, is_active, has_prev, has_next)
 
-            card = old_cards.get(batch.order_input)
+            card = old_cards.get(batch.key)
             if card is None or getattr(card, "_sig", None) != sig:
                 # New order, or its visible content changed → (re)build this
                 # one card only. Everything else is reused untouched.
@@ -953,7 +978,7 @@ class ScannerOrderQueueGUI(QMainWindow):
                     card.deleteLater()  # replaced by the rebuilt card
                 card = new_card
 
-            new_cards[batch.order_input] = card
+            new_cards[batch.key] = card
             self._queue_layout.insertWidget(i, card)
 
         # Drop cards for orders that left the queue.
@@ -970,7 +995,7 @@ class ScannerOrderQueueGUI(QMainWindow):
         the card doesn't need rebuilding. Keep in sync with _build.
         (Live upload progress is excluded — it updates the bars in place.)"""
         return (
-            batch.order_input,
+            batch.key,
             batch.display_name,
             batch.status,
             tuple(batch.twin_checks),
@@ -1019,7 +1044,7 @@ class ScannerOrderQueueGUI(QMainWindow):
 
         batch = OrderBatch(text)
         self.order_queue.append(batch)
-        self._active_order_input = text
+        self._active_order_input = batch.key
         self._order_input.clear()
         self._log(f"Added order {text} to queue (now active)", "INFO")
         self._rebuild_right_panel()
@@ -1038,7 +1063,7 @@ class ScannerOrderQueueGUI(QMainWindow):
             return
         if not batch.twin_checks:
             QMessageBox.information(self, "No scans",
-                                    f"No twin checks assigned to order {order_input} yet.")
+                                    f"No twin checks assigned to {batch.display_name} yet.")
             return
 
         # Gate: refuse to upload until every file has settled and every JPEG
@@ -1054,18 +1079,18 @@ class ScannerOrderQueueGUI(QMainWindow):
             extra = "" if len(not_ready) <= 20 else f"\n  …and {len(not_ready) - 20} more"
             QMessageBox.warning(
                 self, "Not ready to upload",
-                f"Order {order_input} has files that are still being written "
+                f"{batch.display_name} has files that are still being written "
                 "or incomplete:\n\n"
                 + "\n".join(f"  • {x}" for x in shown) + extra
                 + "\n\nWait for scanning to finish, then try again.",
             )
-            self._log(f"Upload blocked for {order_input}: {len(not_ready)} file(s) not ready",
+            self._log(f"Upload blocked for {batch.display_name}: {len(not_ready)} file(s) not ready",
                       "ERROR")
             return
 
         reply = QMessageBox.question(
             self, "Confirm Upload",
-            f"Upload {len(batch.twin_checks)} twin check(s) for order {order_input}?\n\n"
+            f"Upload {len(batch.twin_checks)} twin check(s) for {batch.display_name}?\n\n"
             + "\n".join(f"  • {t}" for t in batch.twin_checks),
             QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
         )
@@ -1077,7 +1102,7 @@ class ScannerOrderQueueGUI(QMainWindow):
         batch.status = "queued"
         if order_input not in self._upload_pending:
             self._upload_pending.append(order_input)
-        self._log(f"Queued {order_input} for upload "
+        self._log(f"Queued {batch.display_name} for upload "
                   f"(position {len(self._upload_pending)})", "INFO")
         self._rebuild_right_panel()
         self._start_next_upload()
@@ -1095,12 +1120,16 @@ class ScannerOrderQueueGUI(QMainWindow):
 
             self._upload_active = order_input
             batch.status = "uploading"
-            self._log(f"Starting upload for {order_input}…", "INFO")
+            self._log(f"Starting upload for {batch.display_name}…", "INFO")
             self._rebuild_right_panel()
 
             scan_root = Path(router.get_noritsu_root())
-            worker = UploadOrderWorker(order_input, batch.twin_checks, scan_root,
-                                       pending_tags=batch.pending_tags)
+            # order_input here is the batch KEY (popped from _upload_pending);
+            # the worker needs the raw typed order for the Shopify lookup and
+            # the key for its signals.
+            worker = UploadOrderWorker(batch.order_input, batch.twin_checks, scan_root,
+                                       pending_tags=batch.pending_tags,
+                                       key=batch.key)
             worker.order_resolved.connect(self._on_order_resolved)
             worker.scan_upload_started.connect(self._on_scan_upload_started)
             worker.scan_upload_progress.connect(self._on_scan_upload_progress)
@@ -1356,25 +1385,25 @@ class ScannerOrderQueueGUI(QMainWindow):
         """Return the batch that incoming scans should go into."""
         # Try to find by stored active key
         for b in self.order_queue:
-            if b.order_input == self._active_order_input and b.status == "pending":
+            if b.key == self._active_order_input and b.status == "pending":
                 return b
         # Fall back: last pending non-unassigned, else unassigned
         for b in reversed(self.order_queue):
             if b.order_input != UNASSIGNED and b.status == "pending":
-                self._active_order_input = b.order_input
+                self._active_order_input = b.key
                 return b
         self._active_order_input = UNASSIGNED
         return self._unassigned
 
     def _find_batch(self, order_input: str) -> Optional[OrderBatch]:
         for b in self.order_queue:
-            if b.order_input == order_input:
+            if b.key == order_input:
                 return b
         return None
 
     def _find_batch_index(self, order_input: str) -> Optional[int]:
         for i, b in enumerate(self.order_queue):
-            if b.order_input == order_input:
+            if b.key == order_input:
                 return i
         return None
 

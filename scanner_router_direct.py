@@ -20,8 +20,11 @@ import traceback
 from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import dropbox
-from dropbox.files import WriteMode
+from dropbox.files import (
+    WriteMode, CommitInfo, UploadSessionCursor, UploadSessionFinishArg,
+)
 from dropbox.exceptions import ApiError, RateLimitError, AuthError
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Error log file for Dropbox errors
 DROPBOX_ERROR_LOG_FILE = Path(__file__).parent / "dropbox_errors.log"
@@ -1175,6 +1178,252 @@ def upload_folder(local_dir: Path, dropbox_path: str, progress_callback=None, up
             progress_callback(0, 0, error_msg)
 
     return count
+
+
+# ---------------------------------------------------------------------------
+# Batch-session upload engine
+#
+# files_upload counts one WRITE OPERATION per file, and Dropbox throttles
+# bursts of write ops (too_many_write_operations) — that is what made per-file
+# uploads crawl. Upload *sessions* stream the bytes without a write op, and a
+# single finish_batch call commits a whole twin check folder as ONE write op.
+# Sessions are also streamed a few files at a time in parallel, which hides
+# SMB read latency and HTTP round-trips.
+#
+# Safety is unchanged: every file's bytes come from _read_complete_bytes (the
+# grey-file gate), and every committed file is verified against the size and
+# Dropbox content-hash of the bytes that were sent. Failed or mismatched
+# commits are re-staged and re-committed; if they still fail the caller gets
+# UploadVerificationError — a scan is never silently half-uploaded.
+# ---------------------------------------------------------------------------
+
+# Dropbox caps a single session_start/append payload at 150 MB.
+BATCH_SESSION_CHUNK = 64 * 1024 * 1024
+# finish_batch accepts at most 1000 entries per call.
+BATCH_FINISH_LIMIT = 1000
+# How many times to re-send files whose commit failed or verified wrong.
+BATCH_COMMIT_RETRIES = 3
+# Concurrent session streams (session uploads are data-plane, not write ops).
+BATCH_UPLOAD_WORKERS = max(1, int(os.getenv("BATCH_UPLOAD_WORKERS", "4")))
+
+
+class UploadAborted(Exception):
+    """Raised by batch_upload_folder when the caller's abort_check trips."""
+
+
+def _retry_after_seconds(e: Exception, fallback: float = 3.0) -> float:
+    rl = _extract_rate_limit_error(e)
+    if rl is not None and getattr(rl, "retry_after", None):
+        try:
+            return float(rl.retry_after) + 2.0
+        except (TypeError, ValueError):
+            pass
+    return fallback
+
+
+def _with_dropbox_retry(fn, what: str, attempts: int = 5):
+    """Run a Dropbox call, retrying rate limits (respecting retry_after),
+    transient ApiErrors (exponential backoff) and expired-token refreshes."""
+    delay = 2.0
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except AuthError as e:
+            if attempt < attempts and "expired" in str(e).lower():
+                refresh_dbx_if_needed()
+                continue
+            raise
+        except (RateLimitError, ApiError) as e:
+            if attempt >= attempts:
+                raise
+            if _extract_rate_limit_error(e) is not None:
+                wait = _retry_after_seconds(e)
+            else:
+                wait = delay
+                delay = min(delay * 2, 60.0)
+            log_dropbox_error(f"Batch {what} (retry {attempt})", e, "")
+            time.sleep(wait)
+
+
+class _BatchPendingFile:
+    """One file staged for the batch commit."""
+
+    def __init__(self, local_path: Optional[Path], dest: str,
+                 data: Optional[bytes] = None):
+        self.local_path = local_path      # None for static bytes (WPPC.jpg)
+        self.dest = dest
+        self.data = data                  # held only until the session is sent
+        self.size = 0
+        self.content_hash = ""
+        self.session_id = ""
+
+    @property
+    def name(self) -> str:
+        return self.local_path.name if self.local_path else Path(self.dest).name
+
+    def read(self) -> bytes:
+        if self.data is not None:
+            return self.data
+        # The grey-file gate: waits for the file to settle and refuses
+        # truncated/unwritten JPEGs.
+        return _read_complete_bytes(self.local_path)
+
+
+def _batch_start_session(pf: _BatchPendingFile) -> None:
+    """Read the file's verified-complete bytes and stream them into an upload
+    session. Records size + content hash so the commit can be verified
+    without keeping the bytes in memory."""
+    data = pf.read()
+    pf.size = len(data)
+    pf.content_hash = _dropbox_content_hash(data)
+
+    if len(data) <= BATCH_SESSION_CHUNK:
+        res = _with_dropbox_retry(
+            lambda: DBX.files_upload_session_start(data, close=True),
+            f"session_start {pf.dest}")
+        pf.session_id = res.session_id
+    else:
+        res = _with_dropbox_retry(
+            lambda: DBX.files_upload_session_start(data[:BATCH_SESSION_CHUNK]),
+            f"session_start {pf.dest}")
+        pf.session_id = res.session_id
+        offset = BATCH_SESSION_CHUNK
+        while offset < len(data):
+            chunk = data[offset:offset + BATCH_SESSION_CHUNK]
+            last = (offset + len(chunk)) >= len(data)
+            cursor = UploadSessionCursor(pf.session_id, offset)
+            _with_dropbox_retry(
+                lambda c=chunk, cur=cursor, cl=last:
+                    DBX.files_upload_session_append_v2(c, cur, close=cl),
+                f"session_append {pf.dest}")
+            offset += len(chunk)
+    pf.data = None  # bytes are on Dropbox's side now; free the memory
+
+
+def _batch_finish(pending: List[_BatchPendingFile]) -> List[Tuple[_BatchPendingFile, str]]:
+    """Commit every staged session — one write operation per 1000 files.
+    Returns [(file, reason)] for entries that failed or verified wrong."""
+    failed: List[Tuple[_BatchPendingFile, str]] = []
+    for i in range(0, len(pending), BATCH_FINISH_LIMIT):
+        chunk = pending[i:i + BATCH_FINISH_LIMIT]
+        entries = [
+            UploadSessionFinishArg(
+                cursor=UploadSessionCursor(pf.session_id, pf.size),
+                commit=CommitInfo(path=pf.dest, mode=WriteMode.overwrite),
+            )
+            for pf in chunk
+        ]
+        result = _with_dropbox_retry(
+            lambda e=entries: DBX.files_upload_session_finish_batch_v2(e),
+            "finish_batch")
+        for pf, entry in zip(chunk, result.entries):
+            if entry.is_failure():
+                failed.append((pf, str(entry.get_failure())))
+                continue
+            md = entry.get_success()
+            stored_size = getattr(md, "size", None)
+            stored_hash = getattr(md, "content_hash", None)
+            if stored_size is not None and stored_size != pf.size:
+                failed.append(
+                    (pf, f"Dropbox stored {stored_size} of {pf.size} bytes "
+                         "(truncated in transit)"))
+            elif stored_hash and stored_hash != pf.content_hash:
+                failed.append((pf, "content-hash mismatch (corrupted in transit)"))
+    return failed
+
+
+def batch_upload_folder(local_dir: Path, dropbox_path: str,
+                        progress_callback=None, abort_check=None,
+                        exclude_files: set = None,
+                        max_workers: int = None) -> int:
+    """Upload a folder via parallel upload sessions + one batch commit.
+
+    Raises IncompleteUploadError for grey/still-writing local files,
+    UploadVerificationError when Dropbox keeps a bad copy after
+    BATCH_COMMIT_RETRIES re-sends, and UploadAborted when abort_check trips.
+    Returns the number of files committed."""
+
+    def _progress(cur, tot, msg):
+        if progress_callback:
+            progress_callback(cur, tot, msg)
+
+    def _aborted():
+        return bool(abort_check and abort_check())
+
+    _excluded = {n.lower() for n in (exclude_files or {"thumbs.db"})}
+    pending: List[_BatchPendingFile] = []
+    for file_path in sorted(local_dir.rglob("*")):
+        if not file_path.is_file() or file_path.name.lower() in _excluded:
+            continue
+        rel = file_path.relative_to(local_dir)
+        pending.append(_BatchPendingFile(file_path, f"{dropbox_path}/{rel}"))
+
+    wppc_path = Path(__file__).parent / "WPPC.jpg"
+    if wppc_path.exists():
+        pending.append(_BatchPendingFile(None, f"{dropbox_path}/WPPC.jpg",
+                                         data=wppc_path.read_bytes()))
+
+    total = len(pending)
+    if total == 0:
+        return 0
+
+    refresh_dbx_if_needed()
+    _progress(0, total, "Starting upload...")
+
+    # Phase 1: stream every file into its own upload session (no write ops),
+    # a few files in flight at once. Any failure (grey file, exhausted
+    # retries) cancels the rest and fails the whole scan loudly.
+    workers = max(1, max_workers or BATCH_UPLOAD_WORKERS)
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_batch_start_session, pf): pf for pf in pending}
+        try:
+            for fut in as_completed(futures):
+                if _aborted():
+                    raise UploadAborted()
+                fut.result()  # re-raises IncompleteUploadError etc.
+                done += 1
+                _progress(done, total,
+                          f"Sending {futures[fut].name}… ({done}/{total})")
+        except BaseException:
+            for f in futures:
+                f.cancel()
+            raise
+    if _aborted():
+        raise UploadAborted()
+    _progress(total - 1, total, "Committing batch…")
+
+    # Phase 2: one finish_batch commit; retry failed/mismatched entries with
+    # freshly staged sessions (re-reads pass the grey gate again).
+    failed = _batch_finish(pending)
+    attempt = 0
+    while failed and attempt < BATCH_COMMIT_RETRIES:
+        attempt += 1
+        if _aborted():
+            raise UploadAborted()
+        _progress(total - 1, total,
+                  f"⚠️ {len(failed)} file(s) failed to commit — retry {attempt}…")
+        retry_files = []
+        for pf, reason in failed:
+            log_dropbox_error("Batch commit failed", Exception(reason),
+                              f"File: {pf.dest} (retry {attempt})")
+            fresh = _BatchPendingFile(
+                pf.local_path, pf.dest,
+                data=wppc_path.read_bytes() if pf.local_path is None else None)
+            _batch_start_session(fresh)
+            retry_files.append(fresh)
+        failed = _batch_finish(retry_files)
+
+    if failed:
+        detail = "; ".join(f"{Path(pf.dest).name}: {reason}"
+                           for pf, reason in failed[:5])
+        raise UploadVerificationError(
+            f"{len(failed)} file(s) still bad after {BATCH_COMMIT_RETRIES} "
+            f"retries — {detail}")
+
+    _progress(total, total, f"✅ {total} files uploaded")
+    return total
+
 
 def set_order_gui(order_num_raw: str, tags: Optional[List[str]] = None) -> bool:
     """Set the order from GUI (non-interactive version)"""
