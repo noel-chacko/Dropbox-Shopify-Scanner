@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QTextEdit, QProgressBar,
     QGroupBox, QMessageBox, QSplitter, QScrollArea, QFrame,
     QFileDialog, QDialog, QDialogButtonBox, QDateEdit, QSizePolicy,
+    QComboBox, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QDate, QPoint, QMimeData
 from PySide6.QtGui import QFont, QFontDatabase, QPainter, QBrush, QColor, QRegion, QPolygon, QDrag
@@ -118,6 +119,11 @@ class OrderBatch:
             self.pending_tags = []
 
         self.twin_checks: List[str] = []             # settled scan folder names
+        # Where each scan lives on the server: {scan_name: absolute folder
+        # path}. Scans added from another date folder (Browse Server
+        # Folders) must upload from there, not from the watched folder.
+        # A scan missing here falls back to <watched root>/<scan_name>.
+        self.scan_dirs: Dict[str, str] = {}
         self.status: str = "pending"                 # pending | queued | uploading | completed | error
         self.error_msg: str = ""
         self.error_detail: str = ""
@@ -135,6 +141,23 @@ class OrderBatch:
             return "Unassigned"
         num = self.order_no or self.order_number
         return f"Order #{num}"
+
+    def scan_dir(self, scan_name: str) -> Path:
+        """The server folder this scan uploads from."""
+        if scan_name in self.scan_dirs:
+            return Path(self.scan_dirs[scan_name])
+        return Path(router.get_noritsu_root()) / scan_name
+
+
+def _move_scan(src: "OrderBatch", dst: "OrderBatch", scan_name: str) -> None:
+    """Move a scan between batches, carrying its source folder with it."""
+    if scan_name in src.twin_checks:
+        src.twin_checks.remove(scan_name)
+    path = src.scan_dirs.pop(scan_name, None)
+    if scan_name not in dst.twin_checks:
+        dst.twin_checks.append(scan_name)
+    if path is not None:
+        dst.scan_dirs[scan_name] = path
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +335,8 @@ class UploadOrderWorker(QThread):
     upload_error = Signal(str, str)                   # order_input, error_msg
 
     def __init__(self, order_input: str, twin_checks: List[str], scan_root: Path,
-                 pending_tags: List[str] = None, key: str = None):
+                 pending_tags: List[str] = None, key: str = None,
+                 scan_paths: Dict[str, str] = None):
         super().__init__()
         # Signals echo the batch's unique key so the GUI updates the right
         # batch even when the same order number is queued twice.
@@ -321,6 +345,8 @@ class UploadOrderWorker(QThread):
         self.twin_checks = list(twin_checks)
         self.scan_root = scan_root
         self.pending_tags = list(pending_tags or [])
+        # {scan_name: folder} — scans can come from different date folders.
+        self.scan_paths = dict(scan_paths or {})
         self._abort = False
 
     def abort(self):
@@ -360,7 +386,9 @@ class UploadOrderWorker(QThread):
             for scan_name in self.twin_checks:
                 if self._abort:
                     return
-                scan_dir = self.scan_root / scan_name
+                scan_dir = (Path(self.scan_paths[scan_name])
+                            if scan_name in self.scan_paths
+                            else self.scan_root / scan_name)
                 if not scan_dir.exists():
                     self.scan_upload_progress.emit(
                         self.order_input, scan_name, 0, 0,
@@ -734,6 +762,301 @@ class OrderGroupWidget(QFrame):
 
 
 # ---------------------------------------------------------------------------
+# Server folder browser
+# ---------------------------------------------------------------------------
+
+def _norm_path(p) -> str:
+    """Comparable form of a path (case/separator-insensitive on Windows)."""
+    return os.path.normcase(os.path.normpath(str(p)))
+
+
+class _BackgroundCall(QThread):
+    """Runs one function off the GUI thread — directory listings over SMB
+    can stall for seconds (or much longer if the share is unreachable)."""
+
+    done = Signal(object, str)   # result, error message ("" on success)
+
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    def run(self):
+        try:
+            self.done.emit(self._fn(), "")
+        except Exception as e:
+            self.done.emit(None, str(e))
+
+
+def _list_date_folders(base: str, watched: str) -> List[tuple]:
+    """[(label, path)] of the date folders under the scanner base, newest
+    first. The watched folder is always included (and marked), even when
+    'Change Folder' pointed it somewhere outside the base."""
+    out = []
+    seen = set()
+    if watched:
+        out.append((f"{Path(watched).name}  (watching)", watched))
+        seen.add(_norm_path(watched))
+    if base and Path(base).exists():
+        dated = sorted((d for d in Path(base).iterdir()
+                        if d.is_dir() and re.fullmatch(r"\d{8}", d.name)),
+                       key=lambda d: d.name, reverse=True)
+        for d in dated:
+            if _norm_path(d) not in seen:
+                out.append((d.name, str(d)))
+                seen.add(_norm_path(d))
+    return out
+
+
+def _list_scan_folders(date_dir: str) -> List[tuple]:
+    """[(name, path, file_count, size_mb, latest_mtime)] for each scan
+    folder in a date folder, newest twin check number first."""
+    rows = []
+    for d in sorted((d for d in Path(date_dir).iterdir() if d.is_dir()),
+                    key=lambda d: d.name, reverse=True):
+        count, size_mb, latest = ScanQueueWorker._folder_stats(d)
+        rows.append((d.name, str(d), count, size_mb, latest))
+    return rows
+
+
+class ServerFolderBrowser(QDialog):
+    """Pick scan folders from any date folder on the server and send them
+    to an order in the queue — for re-uploads and scans that errored."""
+
+    NEW_ORDER = "__NEW_ORDER__"
+
+    def __init__(self, parent, watched_root: str, base: str,
+                 in_queue: Dict[str, List[str]], settling: set,
+                 destinations: List[tuple], default_dest: str):
+        """in_queue: {normalized scan path: ["Order #123 · completed", …]}
+        destinations: [(label, batch key)] of batches that can take scans."""
+        super().__init__(parent)
+        self.setWindowTitle("Server Folders")
+        self.resize(860, 620)
+        self._watched_root = watched_root
+        self._base = base
+        self._in_queue = in_queue
+        self._settling = settling
+        self._threads: List[_BackgroundCall] = []
+        self._listing_for: Optional[str] = None
+
+        # Result, read by the main window after exec() == Accepted
+        self.selected: List[tuple] = []       # [(scan_name, scan_path)]
+        self.dest_key: Optional[str] = None   # batch key, or NEW_ORDER
+        self.new_order_text: str = ""
+
+        lay = QVBoxLayout(self)
+
+        # --- Date folder + filter ---
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Date folder:"))
+        self._date_combo = QComboBox()
+        self._date_combo.setMinimumWidth(220)
+        self._date_combo.currentIndexChanged.connect(self._on_date_changed)
+        top.addWidget(self._date_combo)
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self._reload_folders)
+        top.addWidget(refresh_btn)
+        top.addStretch()
+        top.addWidget(QLabel("Filter:"))
+        self._filter = QLineEdit()
+        self._filter.setPlaceholderText("twin check number…")
+        self._filter.textChanged.connect(self._apply_filter)
+        top.addWidget(self._filter)
+        lay.addLayout(top)
+
+        self._status = QLabel("Loading date folders…")
+        self._status.setFont(QFont("Arial", 9))
+        lay.addWidget(self._status)
+
+        # --- Folder table ---
+        self._table = QTableWidget(0, 4)
+        self._table.setHorizontalHeaderLabels(
+            ["Twin check", "Files", "Last modified", "In queue"])
+        self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._table.verticalHeader().setVisible(False)
+        hdr = self._table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(3, QHeaderView.Stretch)
+        self._table.itemSelectionChanged.connect(self._update_add_enabled)
+        lay.addWidget(self._table, 1)
+
+        hint = QLabel("Ctrl/Shift-click to select several. Folders on a pending "
+                      "or errored order are moved; completed orders are left as a record.")
+        hint.setWordWrap(True)
+        hint.setFont(QFont("Arial", 9))
+        lay.addWidget(hint)
+
+        # --- Destination ---
+        dest_row = QHBoxLayout()
+        dest_row.addWidget(QLabel("Add to:"))
+        self._dest_combo = QComboBox()
+        self._dest_combo.addItem("New order…", self.NEW_ORDER)
+        for label, key in destinations:
+            self._dest_combo.addItem(label, key)
+        idx = self._dest_combo.findData(default_dest)
+        self._dest_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._dest_combo.currentIndexChanged.connect(self._on_dest_changed)
+        dest_row.addWidget(self._dest_combo)
+        self._new_order = QLineEdit()
+        self._new_order.setPlaceholderText("Order number (e.g. 12345 or 12345s)")
+        self._new_order.textChanged.connect(self._update_add_enabled)
+        self._new_order.returnPressed.connect(self._on_accept)
+        dest_row.addWidget(self._new_order, 1)
+        lay.addLayout(dest_row)
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btns.addWidget(cancel_btn)
+        self._add_btn = QPushButton("Add to Queue")
+        self._add_btn.setFont(QFont("Arial", 11, QFont.Bold))
+        self._add_btn.clicked.connect(self._on_accept)
+        btns.addWidget(self._add_btn)
+        lay.addLayout(btns)
+
+        self._on_dest_changed()
+        self._run_bg(lambda: _list_date_folders(self._base, self._watched_root),
+                     self._on_dates_loaded)
+
+    # -- background work -------------------------------------------------
+
+    def _run_bg(self, fn, slot):
+        t = _BackgroundCall(fn)
+        t.done.connect(slot)
+        # Keep a reference until the thread has fully stopped — dropping the
+        # last reference to a running QThread aborts the app.
+        t.finished.connect(lambda t=t: self._threads.remove(t) if t in self._threads else None)
+        self._threads.append(t)
+        t.start()
+
+    def done(self, result):
+        # Closing while a slow SMB listing is in flight: let the threads
+        # finish in the background instead of blocking the UI on them.
+        # Results arriving after close are ignored (see _listing_for).
+        self._listing_for = None
+        parent = self.parent()
+        if parent is not None and self._threads:
+            keep = getattr(parent, "_orphan_threads", [])
+            keep.extend(self._threads)
+            parent._orphan_threads = keep
+            for t in self._threads:
+                t.finished.connect(lambda t=t, k=keep: k.remove(t) if t in k else None)
+        super().done(result)
+
+    # -- dates / folders ---------------------------------------------------
+
+    def _on_dates_loaded(self, dates, err):
+        if not self.isVisible():
+            return
+        if err:
+            self._status.setText(f"⚠️ Cannot read the scanner folder: {err}")
+            return
+        self._date_combo.blockSignals(True)
+        for label, path in dates or []:
+            self._date_combo.addItem(label, path)
+        self._date_combo.blockSignals(False)
+        if self._date_combo.count() == 0:
+            self._status.setText("No date folders found.")
+            return
+        self._date_combo.setCurrentIndex(0)
+        self._reload_folders()
+
+    def _on_date_changed(self, _idx):
+        self._reload_folders()
+
+    def _reload_folders(self):
+        path = self._date_combo.currentData()
+        if not path:
+            return
+        self._listing_for = path
+        self._table.setRowCount(0)
+        self._status.setText(f"Loading {path}…")
+        self._run_bg(lambda p=path: (p, _list_scan_folders(p)), self._on_folders_loaded)
+
+    def _on_folders_loaded(self, result, err):
+        if not self.isVisible():
+            return
+        if err:
+            self._status.setText(f"⚠️ Cannot list folder: {err}")
+            return
+        path, rows = result
+        if path != self._listing_for:
+            return  # a newer date was picked while this one was loading
+        is_watched = _norm_path(path) == _norm_path(self._watched_root)
+
+        self._table.setSortingEnabled(False)
+        self._table.setRowCount(len(rows))
+        for r, (name, scan_path, count, size_mb, latest) in enumerate(rows):
+            name_item = QTableWidgetItem(name)
+            name_item.setData(Qt.UserRole, scan_path)
+            self._table.setItem(r, 0, name_item)
+
+            files_item = QTableWidgetItem()
+            files_item.setData(Qt.DisplayRole, count)
+            files_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self._table.setItem(r, 1, files_item)
+
+            when = datetime.fromtimestamp(latest).strftime("%Y-%m-%d %H:%M") if latest else "—"
+            self._table.setItem(r, 2, QTableWidgetItem(when))
+
+            where = ", ".join(self._in_queue.get(_norm_path(scan_path), []))
+            if is_watched and name in self._settling:
+                where = "⏳ still scanning" + (f" — {where}" if where else "")
+            self._table.setItem(r, 3, QTableWidgetItem(where or "—"))
+        self._table.setSortingEnabled(True)
+        self._table.sortItems(0, Qt.DescendingOrder)
+        self._status.setText(f"{len(rows)} folder(s) in {path}")
+        self._apply_filter()
+        self._update_add_enabled()
+
+    def _apply_filter(self):
+        text = self._filter.text().strip().lower()
+        for r in range(self._table.rowCount()):
+            item = self._table.item(r, 0)
+            self._table.setRowHidden(r, bool(text) and text not in item.text().lower())
+
+    # -- destination / accept ----------------------------------------------
+
+    def _on_dest_changed(self, *_):
+        is_new = self._dest_combo.currentData() == self.NEW_ORDER
+        self._new_order.setVisible(is_new)
+        if is_new:
+            self._new_order.setFocus()
+        self._update_add_enabled()
+
+    def _selected_rows(self) -> List[tuple]:
+        rows = sorted({i.row() for i in self._table.selectedItems()})
+        out = []
+        for r in rows:
+            if self._table.isRowHidden(r):
+                continue
+            item = self._table.item(r, 0)
+            out.append((item.text(), item.data(Qt.UserRole)))
+        return out
+
+    def _update_add_enabled(self):
+        ok = bool(self._selected_rows())
+        if self._dest_combo.currentData() == self.NEW_ORDER:
+            ok = ok and bool(self._new_order.text().strip())
+        self._add_btn.setEnabled(ok)
+        n = len(self._selected_rows())
+        self._add_btn.setText(f"Add {n} to Queue" if n else "Add to Queue")
+
+    def _on_accept(self):
+        if not self._add_btn.isEnabled():
+            return
+        self.selected = self._selected_rows()
+        self.dest_key = self._dest_combo.currentData()
+        self.new_order_text = self._new_order.text().strip()
+        self.accept()
+
+
+# ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
 
@@ -831,6 +1154,13 @@ class ScannerOrderQueueGUI(QMainWindow):
         add_btn.setMinimumHeight(46)
         add_btn.clicked.connect(self._add_order)
         og.addWidget(add_btn)
+
+        browse_btn = QPushButton("Browse Server Folders…")
+        browse_btn.setMinimumHeight(36)
+        browse_btn.setToolTip("Pick twin check folders from any date on the server "
+                              "to re-upload or retry, and add them to an order.")
+        browse_btn.clicked.connect(self._open_folder_browser)
+        og.addWidget(browse_btn)
 
         layout.addWidget(order_group)
 
@@ -1020,6 +1350,9 @@ class ScannerOrderQueueGUI(QMainWindow):
         active = self._get_active_batch()
         if scan_name not in active.twin_checks:
             active.twin_checks.append(scan_name)
+        # Pin the scan to the folder it settled in, so a later Change Folder
+        # (or a manual add from another day) can't point it elsewhere.
+        active.scan_dirs[scan_name] = str(Path(router.get_noritsu_root()) / scan_name)
 
         self._warn_if_duplicate(scan_name)
         self._log(f"📷 Settled: {scan_name} → {active.display_name}", "SUCCESS")
@@ -1054,6 +1387,104 @@ class ScannerOrderQueueGUI(QMainWindow):
         ))
 
     # ------------------------------------------------------------------
+    # Slot: browse server folders (manual add / re-upload)
+    # ------------------------------------------------------------------
+
+    def _open_folder_browser(self):
+        # Where every scan in the queue lives, so the browser can show it.
+        in_queue: Dict[str, List[str]] = {}
+        for b in self.order_queue:
+            for sn in b.twin_checks:
+                in_queue.setdefault(_norm_path(b.scan_dir(sn)), []).append(
+                    f"{b.display_name} · {b.status}")
+
+        # Only batches that can still take scans: pending ones.
+        destinations = [("Unassigned", UNASSIGNED)]
+        destinations += [(b.display_name + (f"  ({b.order_input})"
+                                            if b.order_input != b.order_number else ""),
+                          b.key)
+                         for b in self.order_queue
+                         if b.order_input != UNASSIGNED and b.status == "pending"]
+        active = self._get_active_batch()
+        default = active.key if active.order_input != UNASSIGNED else ServerFolderBrowser.NEW_ORDER
+
+        dlg = ServerFolderBrowser(
+            self,
+            watched_root=router.get_noritsu_root(),
+            base=router.get_noritsu_base(),
+            in_queue=in_queue,
+            settling=set(self._settling.keys()),
+            destinations=destinations,
+            default_dest=default,
+        )
+        # Keep the dialog alive until the next open, so a listing thread
+        # still finishing after close never signals a deleted object.
+        self._folder_browser = dlg
+        if dlg.exec() != QDialog.Accepted or not dlg.selected:
+            return
+        self._add_manual_scans(dlg.selected, dlg.dest_key, dlg.new_order_text)
+
+    def _add_manual_scans(self, selected: List[tuple], dest_key: str, new_order_text: str):
+        """Put hand-picked server folders into an order.
+
+        Copies on pending/errored cards are moved; completed cards are left
+        alone as a record; cards mid-upload are never touched."""
+        # --- Resolve the destination batch ---
+        if dest_key == ServerFolderBrowser.NEW_ORDER:
+            dest = next((b for b in self.order_queue
+                         if b.order_input == new_order_text and b.status == "pending"), None)
+            if dest is None:
+                dest = OrderBatch(new_order_text)
+                self.order_queue.append(dest)
+                self._log(f"Added order {new_order_text} to queue (from server folders)", "INFO")
+        else:
+            dest = self._find_batch(dest_key)
+            if dest is None or dest.status != "pending":
+                QMessageBox.warning(
+                    self, "Order not available",
+                    "That order was confirmed or removed while the window was open. "
+                    "Pick another order and try again.")
+                return
+
+        watched = _norm_path(router.get_noritsu_root())
+        added, busy = [], []
+        for scan_name, scan_path in selected:
+            target = _norm_path(scan_path)
+            holders = [b for b in self.order_queue
+                       if b is not dest and scan_name in b.twin_checks
+                       and _norm_path(b.scan_dir(scan_name)) == target]
+            if any(b.status in ("queued", "uploading") for b in holders):
+                busy.append(scan_name)
+                continue
+            for b in holders:
+                if b.status in ("pending", "error"):
+                    b.twin_checks.remove(scan_name)
+                    b.scan_dirs.pop(scan_name, None)
+                    self._log(f"Moved {scan_name}: {b.display_name} → {dest.display_name}", "INFO")
+                # completed: leave it on the old card as the upload record
+
+            if scan_name not in dest.twin_checks:
+                dest.twin_checks.append(scan_name)
+            dest.scan_dirs[scan_name] = scan_path
+            added.append(scan_name)
+
+            # A folder in the watched date folder must not be picked up again
+            # by the scanner loop and dropped into the active order later.
+            if _norm_path(Path(scan_path).parent) == watched:
+                self.scanner.add_to_processed(scan_name)
+
+        if added:
+            self._log(f"📂 Added {len(added)} folder(s) to {dest.display_name}: "
+                      f"{', '.join(added)}", "SUCCESS")
+        if busy:
+            QMessageBox.information(
+                self, "Some folders skipped",
+                "These are uploading right now, so they were left where they are:\n\n"
+                + "\n".join(f"  • {s}" for s in busy)
+                + "\n\nAdd them again once that upload finishes.")
+        self._rebuild_right_panel()
+
+    # ------------------------------------------------------------------
     # Slot: confirm order
     # ------------------------------------------------------------------
 
@@ -1068,10 +1499,9 @@ class ScannerOrderQueueGUI(QMainWindow):
 
         # Gate: refuse to upload until every file has settled and every JPEG
         # is a complete image. Better to wait than upload a half-grey scan.
-        scan_root = Path(router.get_noritsu_root())
         not_ready = []
         for sn in batch.twin_checks:
-            ok, issues = router.folder_upload_ready(scan_root / sn)
+            ok, issues = router.folder_upload_ready(batch.scan_dir(sn))
             if not ok:
                 not_ready.extend(f"{sn} → {i}" for i in issues)
         if not_ready:
@@ -1129,7 +1559,9 @@ class ScannerOrderQueueGUI(QMainWindow):
             # the key for its signals.
             worker = UploadOrderWorker(batch.order_input, batch.twin_checks, scan_root,
                                        pending_tags=batch.pending_tags,
-                                       key=batch.key)
+                                       key=batch.key,
+                                       scan_paths={sn: str(batch.scan_dir(sn))
+                                                   for sn in batch.twin_checks})
             worker.order_resolved.connect(self._on_order_resolved)
             worker.scan_upload_started.connect(self._on_scan_upload_started)
             worker.scan_upload_progress.connect(self._on_scan_upload_progress)
@@ -1170,10 +1602,7 @@ class ScannerOrderQueueGUI(QMainWindow):
         src = self.order_queue[src_idx]
         dst = self.order_queue[dst_idx]
 
-        if scan_name in src.twin_checks:
-            src.twin_checks.remove(scan_name)
-        if scan_name not in dst.twin_checks:
-            dst.twin_checks.append(scan_name)
+        _move_scan(src, dst, scan_name)
 
         self._log(f"Moved {scan_name}: {src.display_name} → {dst.display_name}", "INFO")
         self._rebuild_right_panel()
@@ -1189,10 +1618,7 @@ class ScannerOrderQueueGUI(QMainWindow):
         src = self.order_queue[src_idx]
         dst = self.order_queue[dst_idx]
 
-        if scan_name in src.twin_checks:
-            src.twin_checks.remove(scan_name)
-        if scan_name not in dst.twin_checks:
-            dst.twin_checks.append(scan_name)
+        _move_scan(src, dst, scan_name)
 
         self._log(
             f"Moved {scan_name}: {src.display_name} → {dst.display_name}", "INFO"
@@ -1444,10 +1870,7 @@ class ScannerOrderQueueGUI(QMainWindow):
         dst = self._find_batch(dst_order)
         if not src or not dst:
             return
-        if scan_name in src.twin_checks:
-            src.twin_checks.remove(scan_name)
-        if scan_name not in dst.twin_checks:
-            dst.twin_checks.append(scan_name)
+        _move_scan(src, dst, scan_name)
         self._warn_if_duplicate(scan_name)
         self._log(f"Dropped {scan_name}: {src.display_name} → {dst.display_name}", "INFO")
         self._rebuild_right_panel()
@@ -1501,6 +1924,17 @@ class ScannerOrderQueueGUI(QMainWindow):
             if not worker.wait(20000):
                 worker.terminate()
                 worker.wait()
+
+        # Folder listings left running by a closed Server Folders window.
+        # They only read directories, so terminating a stuck one is safe.
+        for t in list(getattr(self, "_orphan_threads", [])):
+            try:
+                t.done.disconnect()
+            except Exception:
+                pass
+            if not t.wait(3000):
+                t.terminate()
+                t.wait()
 
         event.accept()
 
