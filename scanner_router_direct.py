@@ -148,6 +148,15 @@ def refresh_access_token() -> Optional[str]:
             auth=(DROPBOX_APP_KEY, DROPBOX_APP_SECRET),
             timeout=30
         )
+        if not response.ok:
+            # Dropbox says why in the body (e.g. invalid_grant = refresh token
+            # revoked or made for a different app). Log it so a dead refresh
+            # token is diagnosable from dropbox_errors.log, not just stdout.
+            log_dropbox_error(
+                "Refresh Access Token",
+                Exception(f"HTTP {response.status_code}: {response.text[:300]}"),
+                "Refresh token rejected - if this says invalid_grant, run "
+                "get_dropbox_refresh_token.py and update DROPBOX_REFRESH_TOKEN in .env")
         response.raise_for_status()
         data = response.json()
         
@@ -210,25 +219,32 @@ HDR = {"X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN, "Content-Type": "applicati
 # Global lock for token refresh
 _token_refresh_lock = threading.Lock()
 
+
+def _is_token_auth_error(e: Exception) -> bool:
+    """True when Dropbox rejected the access token itself and a fresh one
+    from the refresh token can fix it: expired_access_token (normal 4-hour
+    expiry) or invalid_access_token (a stale/revoked token — e.g. the app
+    fell back to an old DROPBOX_TOKEN because the startup refresh failed).
+    Without the invalid case the app never recovers until restarted."""
+    error_str = str(e).lower()
+    reason = ""
+    err = getattr(e, "error", None)
+    if err is not None:
+        reason = str(getattr(err, "error", None) or getattr(err, "reason", None) or err).lower()
+    return any(k in error_str or k in reason
+               for k in ("expired", "invalid_access_token"))
+
+
 def refresh_dbx_if_needed():
-    """Refresh Dropbox client if token is expired"""
+    """Refresh Dropbox client if the token is expired or rejected"""
     global DBX
     with _token_refresh_lock:
         try:
             # Quick test to see if token works
             DBX.users_get_current_account()
         except AuthError as e:
-            # Check if it's an expired token error
-            error_str = str(e).lower()
-            error_reason = None
-            if hasattr(e, 'error'):
-                if hasattr(e.error, 'error'):
-                    error_reason = str(e.error.error).lower()
-                elif hasattr(e.error, 'reason'):
-                    error_reason = str(e.error.reason).lower()
-            
-            if 'expired' in error_str or 'expired_access_token' in error_str or (error_reason and 'expired' in error_reason):
-                print("🔄 Dropbox token expired, refreshing...")
+            if _is_token_auth_error(e):
+                print("🔄 Dropbox token expired or rejected, refreshing...")
                 new_client = get_dropbox_client()
                 if new_client:
                     DBX = new_client
@@ -244,8 +260,7 @@ def handle_dropbox_auth_error(func):
         try:
             return func(*args, **kwargs)
         except AuthError as e:
-            error_str = str(e).lower()
-            if 'expired' in error_str or 'expired_access_token' in error_str:
+            if _is_token_auth_error(e):
                 refresh_dbx_if_needed()
                 # Retry once after refresh
                 return func(*args, **kwargs)
@@ -961,9 +976,8 @@ def _upload_bytes(data: bytes, dropbox_file: str) -> None:
         md = DBX.files_upload(data, dropbox_file, mode=WriteMode.overwrite)
         _verify_uploaded(md, data, dropbox_file)
     except AuthError as e:
-        # Token expired - refresh and retry once with the SAME bytes.
-        error_str = str(e).lower()
-        if 'expired' in error_str or 'expired_access_token' in error_str:
+        # Token expired/rejected - refresh and retry once with the SAME bytes.
+        if _is_token_auth_error(e):
             refresh_dbx_if_needed()
             md = DBX.files_upload(data, dropbox_file, mode=WriteMode.overwrite)
             _verify_uploaded(md, data, dropbox_file)
@@ -1229,7 +1243,7 @@ def _with_dropbox_retry(fn, what: str, attempts: int = 5):
         try:
             return fn()
         except AuthError as e:
-            if attempt < attempts and "expired" in str(e).lower():
+            if attempt < attempts and _is_token_auth_error(e):
                 refresh_dbx_if_needed()
                 continue
             raise
